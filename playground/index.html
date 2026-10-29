@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lumen Playground (M1) — WebAssembly Compiler &amp; Interpreter</title>
+  <!-- Browser importmap so /src/*.js modules that import node:fs / node:path work 100% client-side -->
+  <script type="importmap">
+  {
+    "imports": {
+      "node:fs": "/api/shim/fs.js",
+      "fs": "/api/shim/fs.js",
+      "node:path": "/api/shim/path.js",
+      "path": "/api/shim/path.js",
+      "node:url": "/api/shim/url.js",
+      "url": "/api/shim/url.js",
+      "node:perf_hooks": "/api/shim/perf.js",
+      "perf_hooks": "/api/shim/perf.js"
+    }
+  }
+  </script>
+  <link rel="stylesheet" href="/playground/styles.css" />
+</head>
+<body>
+  <!-- Top IDE Toolbar -->
+  <header class="toolbar">
+    <div class="toolbar-brand">
+      <div class="brand-logo" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <polygon points="12,2 22,8.5 22,15.5 12,22 2,15.5 2,8.5" stroke="#38bdf8" stroke-width="2" fill="rgba(56,189,248,0.14)" />
+          <circle cx="12" cy="12" r="4" fill="#34d399" />
+        </svg>
+      </div>
+      <div class="brand-text">
+        <span class="brand-title">LUMEN</span>
+        <span class="brand-subtitle">M1 WebAssembly Toolchain</span>
+      </div>
+      <span id="compiler-status-badge" class="status-badge status-ready" title="In-browser WebAssembly compiler status">
+        Client Wasm Ready
+      </span>
+    </div>
+
+    <div class="toolbar-controls">
+      <label class="select-wrapper" title="Load a Lumen example program">
+        <span class="select-label">Program</span>
+        <select id="example-select" aria-label="Example Program Selector">
+          <option value="hello">examples/hello.lm (Hello World)</option>
+          <option value="diagnostics">Live Error Squiggles Demo</option>
+        </select>
+      </label>
+
+      <div class="button-group">
+        <button id="btn-run-wasm" class="btn btn-primary" title="Compile .lm to .wasm &amp; execute via WebAssembly.instantiate (Ctrl+Enter)">
+          <span class="btn-icon">▶</span> Compile &amp; Run (Wasm)
+        </button>
+        <button id="btn-run-interp" class="btn btn-secondary" title="Execute in Reference Interpreter &amp; verify parity">
+          <span class="btn-icon">⚡</span> Run (Interpreter)
+        </button>
+        <button id="btn-format" class="btn btn-ghost" title="Format Lumen Source Code (Shift+Alt+F)">
+          <span class="btn-icon">✦</span> Format
+        </button>
+      </div>
+    </div>
+
+    <div class="toolbar-metrics">
+      <span id="badge-compile-time" class="metric-pill" title="Compilation duration">Compile: -- ms</span>
+      <span id="badge-wasm-size" class="metric-pill" title="Emitted raw WebAssembly binary size in bytes">Wasm: -- bytes</span>
+      <span id="badge-parity" class="metric-pill parity-neutral" title="Wasm vs. Reference Interpreter Output Parity">Parity: Ready</span>
+    </div>
+  </header>
+
+  <!-- Main Workspace Split Grid -->
+  <main class="workspace-grid">
+    <!-- LEFT PANE: Code Editor with Syntax Highlighting & Live Error Squiggles -->
+    <section id="editor-pane" class="pane editor-pane" aria-label="Lumen Source Code Editor">
+      <div class="pane-header">
+        <div class="file-tab active">
+          <span class="file-dot"></span>
+          <span id="active-filename">examples/hello.lm</span>
+        </div>
+        <div class="editor-status-pills">
+          <span id="cursor-pos-indicator" class="meta-pill">Ln 1, Col 1</span>
+          <span id="diag-count-badge" class="meta-pill diag-ok">0 Errors</span>
+        </div>
+      </div>
+
+      <div id="editor-container" class="editor-container">
+        <!-- Line Numbers Gutter -->
+        <div id="editor-gutter" class="editor-gutter" aria-hidden="true"></div>
+
+        <!-- Synchronized Code Viewport -->
+        <div id="editor-viewport" class="editor-viewport">
+          <div id="editor-line-highlights" class="editor-line-highlights" aria-hidden="true"></div>
+          <pre id="editor-highlight-layer" class="editor-highlight-layer" aria-hidden="true"><code id="editor-highlight-code"></code></pre>
+          <textarea
+            id="editor-textarea"
+            class="editor-textarea"
+            spellcheck="false"
+            autocomplete="off"
+            autocapitalize="off"
+            wrap="off"
+            aria-label="Lumen code editor"
+          >fn main() {
+    println("Hello, World!");
+}</textarea>
+          <!-- Hover Tooltip for Error Squiggles -->
+          <div id="editor-tooltip" class="editor-tooltip hidden" role="tooltip"></div>
+        </div>
+      </div>
+
+      <!-- Inline Diagnostics Banner Drawer -->
+      <div id="editor-diagnostics-bar" class="editor-diagnostics-bar hidden">
+        <div class="diag-bar-header">
+          <span id="diag-bar-title">Compiler Diagnostics</span>
+          <button id="diag-bar-close" class="btn-icon-only" title="Collapse diagnostics drawer">✕</button>
+        </div>
+        <div id="diag-bar-list" class="diag-bar-list"></div>
+      </div>
+    </section>
+
+    <!-- RIGHT PANE: Live Output, Parity Status & Emitted .wasm Binary Hex Preview -->
+    <section id="output-pane" class="pane output-pane" aria-label="Live Output and WebAssembly Inspector">
+      <div class="pane-header">
+        <div class="file-tab">
+          <span class="gc-status-dot"></span>
+          <span>Live Execution Output &amp; WebAssembly Binary Inspector</span>
+        </div>
+        <div class="inspector-meta">
+          <button id="btn-download-wasm" class="btn-tiny" title="Download compiled .wasm binary file">
+            ⬇ Download <code>.wasm</code>
+          </button>
+        </div>
+      </div>
+
+      <!-- Telemetry & Parity Summary Bar -->
+      <div class="output-summary-bar">
+        <span id="out-exec-mode" class="summary-chip">Engine: WebAssembly</span>
+        <span id="out-wasm-size" class="summary-chip chip-highlight">Wasm Size: -- bytes</span>
+        <span id="out-exec-time" class="summary-chip">Exec: -- ms</span>
+        <span id="out-exit-code" class="summary-chip">Exit Code: --</span>
+        <span id="out-parity-badge" class="summary-chip parity-neutral">Parity: --</span>
+      </div>
+
+      <div class="output-scroll-area">
+        <!-- Standard Output (stdout) -->
+        <div class="console-section">
+          <div class="section-label-row">
+            <span class="section-label">Program Standard Output (<code>stdout</code>)</span>
+            <button id="btn-clear-output" class="btn-tiny">Clear</button>
+          </div>
+          <pre id="output-stdout" class="console-pre">Compiling and running examples/hello.lm...</pre>
+        </div>
+
+        <!-- Compiler & Runtime Diagnostics -->
+        <div id="output-diagnostics-section" class="console-section hidden">
+          <div class="section-label-row">
+            <span class="section-label section-label-error">Compiler &amp; Runtime Diagnostics</span>
+          </div>
+          <pre id="output-diagnostics" class="console-pre console-error"></pre>
+        </div>
+
+        <!-- Emitted .wasm Binary Hex Preview & Lowered LIR -->
+        <div class="inspector-split-section">
+          <div class="ir-wasm-toolbar">
+            <div class="subtab-group">
+              <button id="subtab-btn-split" class="subtab-btn active" data-view="split">Hex + LIR Split</button>
+              <button id="subtab-btn-wasm" class="subtab-btn" data-view="wasm">Wasm Hex Preview</button>
+              <button id="subtab-btn-lir" class="subtab-btn" data-view="lir">Lowered LIR</button>
+            </div>
+            <span id="wasm-sec-count" class="meta-pill">0 bytes</span>
+          </div>
+
+          <div id="ir-wasm-grid" class="ir-wasm-grid">
+            <div id="wasm-panel-box" class="ir-box">
+              <div class="ir-box-header">
+                <span>Emitted <code>.wasm</code> Binary Hex Preview</span>
+                <span id="wasm-magic-badge" class="meta-pill">\0asm v1</span>
+              </div>
+              <pre id="wasm-hex-view" class="code-inspector-pre">Compile a program to inspect raw WebAssembly binary bytes.</pre>
+            </div>
+
+            <div id="lir-panel-box" class="ir-box">
+              <div class="ir-box-header">
+                <span>Lowered Lumen IR (LIR)</span>
+                <span id="lir-fn-count" class="meta-pill">0 functions</span>
+              </div>
+              <pre id="lir-code-view" class="code-inspector-pre">Compile a program to inspect lowered Lumen Intermediate Representation (LIR).</pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/playground/app.js"></script>
+</body>
+</html>

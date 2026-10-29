@@ -1,0 +1,18 @@
+{
+  "name": "lumen-lang",
+  "version": "1.0.0",
+  "description": "Lumen statically typed programming language toolchain targeting raw WebAssembly binary",
+  "type": "module",
+  "bin": {
+    "lumen": "./bin/lumen.js"
+  },
+  "scripts": {
+    "test": "node bin/lumen.js test",
+    "bench": "node benchmarks/run_benchmarks.js",
+    "fuzz": "node src/fuzzer/fuzzer.js",
+    "docs": "node docs/generate_docs.js",
+    "playground": "node playground/server.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
