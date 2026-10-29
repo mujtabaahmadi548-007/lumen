@@ -8,6 +8,7 @@
 import {
   LumenRuntimeError,
   formatFloat64,
+  fnv1aHashBytes,
   alignUp,
   GC_HEADER_SIZE,
   GC_FLAGS,
@@ -185,6 +186,97 @@ function createHostEnv(options = {}) {
         if (mem[a + 12 + i] !== mem[b + 12 + i]) return 0;
       }
       return 1;
+    },
+
+    __lumen_str_slice(strPtr, start, end) {
+      const ptr = strPtr >>> 0;
+      if (!ptr) throw new LumenRuntimeError("string slice out of bounds");
+      const mem = getMemoryBytes();
+      const view = getMemoryView();
+      const byteLen = view.getUint32(ptr + 8, true);
+      const s = start | 0;
+      const e = end | 0;
+      if (s < 0 || e < s || e > byteLen) {
+        throw new LumenRuntimeError("string slice out of bounds");
+      }
+      const slicedBytes = mem.subarray(ptr + 12 + s, ptr + 12 + e);
+      return allocStringInMemory(textDecoder.decode(slicedBytes));
+    },
+
+    __lumen_str_char_at(strPtr, idx) {
+      const ptr = strPtr >>> 0;
+      if (!ptr) throw new LumenRuntimeError("string index out of bounds");
+      const view = getMemoryView();
+      const byteLen = view.getUint32(ptr + 8, true);
+      const i = idx | 0;
+      if (i < 0 || i >= byteLen) {
+        throw new LumenRuntimeError("string index out of bounds");
+      }
+      const mem = getMemoryBytes();
+      return mem[ptr + 12 + i] & 0xff;
+    },
+
+    __lumen_str_from_char_code(code) {
+      const c = code & 0xff;
+      return allocStringInMemory(String.fromCharCode(c));
+    },
+
+    __lumen_str_cmp(ptrA, ptrB) {
+      const a = ptrA >>> 0;
+      const b = ptrB >>> 0;
+      if (a === b) return 0;
+      if (!a) return -1;
+      if (!b) return 1;
+      const mem = getMemoryBytes();
+      const view = getMemoryView();
+      const lenA = view.getUint32(a + 8, true);
+      const lenB = view.getUint32(b + 8, true);
+      const minLen = Math.min(lenA, lenB);
+      for (let i = 0; i < minLen; i++) {
+        const diff = (mem[a + 12 + i] & 0xff) - (mem[b + 12 + i] & 0xff);
+        if (diff !== 0) return diff > 0 ? 1 : -1;
+      }
+      return lenA === lenB ? 0 : lenA < lenB ? -1 : 1;
+    },
+
+    __lumen_str_hash(strPtr) {
+      const ptr = strPtr >>> 0;
+      if (!ptr) return 0;
+      const mem = getMemoryBytes();
+      const view = getMemoryView();
+      const byteLen = view.getUint32(ptr + 8, true);
+      return fnv1aHashBytes(mem.subarray(ptr + 12, ptr + 12 + byteLen));
+    },
+
+    __lumen_str_to_int(strPtr) {
+      const s = readStringFromMemory(strPtr >>> 0);
+      const val = parseInt(s, 10);
+      return Number.isNaN(val) ? 0 : (val | 0);
+    },
+
+    __lumen_f64_sin(x) {
+      return Math.sin(Number(x));
+    },
+
+    __lumen_f64_cos(x) {
+      return Math.cos(Number(x));
+    },
+
+    __lumen_f64_pow(x, y) {
+      return Math.pow(Number(x), Number(y));
+    },
+
+    __lumen_f64_rem(x, y) {
+      return Number(x) % Number(y);
+    },
+
+    __lumen_clock_ms() {
+      return typeof performance !== "undefined" ? performance.now() : Date.now();
+    },
+
+    __lumen_assert_fail(msgPtr) {
+      const msg = readStringFromMemory(msgPtr >>> 0) || "assertion failed";
+      throw new LumenRuntimeError(msg);
     },
 
     __lumen_trap(codeOrPtr) {

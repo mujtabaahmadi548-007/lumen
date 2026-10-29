@@ -68,6 +68,17 @@ const BUILTIN_RETURN_LIR_TYPES = Object.freeze({
   panic: "void",
 });
 
+const COMPARISON_AND_LOGICAL_OPS = new Set([
+  "==",
+  "!=",
+  "<",
+  "<=",
+  ">",
+  ">=",
+  "&&",
+  "||",
+]);
+
 /**
  * Returns true if `expr` is already safely rooted according to `validateLir()`.
  */
@@ -87,6 +98,19 @@ function isAlreadyRootedGcExpr(expr) {
   return false;
 }
 
+function defaultConstForLirType(lirType) {
+  if (lirType === "i64") {
+    return { op: "const_i64", value: 0n, type: "i64" };
+  }
+  if (lirType === "f64") {
+    return { op: "const_f64", value: 0.0, type: "f64" };
+  }
+  if (lirType === "gc_ref") {
+    return { op: "const_i32", value: 0, type: "gc_ref" };
+  }
+  return { op: "const_i32", value: 0, type: "i32" };
+}
+
 class ModuleLowerer {
   constructor(options = {}) {
     this.env = options.env || null;
@@ -99,10 +123,11 @@ class ModuleLowerer {
     this.typeDescriptorMap = new Map(); // name -> descriptor
 
     this.globals = [];
-    this.globalMap = new Map(); // name -> global info
+    this.globalMap = new Map(); // name -> { name, type, isBool, decl }
 
     this.functions = [];
     this.functionReturnTypes = new Map(); // fnName -> LirType
+    this.functionReturnsBool = new Map(); // fnName -> boolean
   }
 
   /**
@@ -117,6 +142,85 @@ class ModuleLowerer {
     this.stringLiterals.push({ id, value: str });
     this.stringMap.set(str, id);
     return id;
+  }
+
+  /**
+   * Check whether a semantic Type or AST TypeNode represents `bool`.
+   */
+  isBoolType(typeOrNode) {
+    if (!typeOrNode) return false;
+    if (typeof typeOrNode === "string") return typeOrNode === "bool";
+    if (typeOrNode.tag) {
+      const t = unwrapType(typeOrNode);
+      return Boolean(t && t.tag === "prim" && t.name === "bool");
+    }
+    if (typeOrNode.resolvedType) {
+      return this.isBoolType(typeOrNode.resolvedType);
+    }
+    if (typeOrNode.inferredType) {
+      return this.isBoolType(typeOrNode.inferredType);
+    }
+    if (typeOrNode.kind === "NamedType") {
+      return typeOrNode.name === "bool";
+    }
+    return false;
+  }
+
+  /**
+   * Check whether an AST expression produces a semantic `bool` value.
+   */
+  isBoolAstExpr(expr, fnCtx) {
+    if (!expr) return false;
+    if (expr.inferredType) {
+      const t = unwrapType(expr.inferredType);
+      if (t && t.tag !== "error") {
+        return t.tag === "prim" && t.name === "bool";
+      }
+    }
+    switch (expr.kind) {
+      case "LiteralExpr":
+        return expr.literalType === "bool";
+      case "IdentExpr": {
+        if (fnCtx) {
+          const local = this.lookupVar(fnCtx, expr.name);
+          if (local) return Boolean(local.isBool);
+        }
+        const glob = this.globalMap.get(expr.name);
+        if (glob) return Boolean(glob.isBool);
+        return false;
+      }
+      case "UnaryExpr":
+        return expr.op === "!";
+      case "BinaryExpr":
+        return COMPARISON_AND_LOGICAL_OPS.has(expr.op);
+      case "CastExpr":
+        return this.isBoolType(expr.targetType);
+      case "CallExpr": {
+        if (expr.callee?.kind === "IdentExpr") {
+          const fnName = expr.callee.name;
+          if (fnName === "str_eq" || fnName === "eq") return true;
+          if (this.functionReturnsBool.has(fnName)) {
+            return this.functionReturnsBool.get(fnName);
+          }
+          if (this.env && this.env.getFunction) {
+            const fnDef = this.env.getFunction(fnName);
+            if (fnDef && fnDef.returnType) {
+              return this.isBoolType(fnDef.returnType);
+            }
+          }
+        }
+        return false;
+      }
+      case "IfExpr":
+        return (
+          this.isBoolAstExpr(expr.thenBlock?.tailExpr, fnCtx) ||
+          this.isBoolAstExpr(expr.elseBlock?.tailExpr, fnCtx)
+        );
+      case "BlockExpr":
+        return this.isBoolAstExpr(expr.block?.tailExpr, fnCtx);
+      default:
+        return false;
+    }
   }
 
   /**
@@ -137,6 +241,7 @@ class ModuleLowerer {
         case "gc_ref":
           return "gc_ref";
         case "void":
+        case "()":
           return "void";
         default:
           return "i32";
@@ -145,11 +250,11 @@ class ModuleLowerer {
     if (typeOrNode.tag) {
       return semanticTypeToLirType(typeOrNode);
     }
-    if (typeOrNode.inferredType) {
-      return semanticTypeToLirType(typeOrNode.inferredType);
-    }
     if (typeOrNode.resolvedType) {
       return semanticTypeToLirType(typeOrNode.resolvedType);
+    }
+    if (typeOrNode.inferredType) {
+      return semanticTypeToLirType(typeOrNode.inferredType);
     }
     if (typeOrNode.kind === "NamedType") {
       switch (typeOrNode.name) {
@@ -163,6 +268,7 @@ class ModuleLowerer {
         case "string":
           return "gc_ref";
         case "void":
+        case "()":
           return "void";
         default:
           return "gc_ref";
@@ -186,30 +292,44 @@ class ModuleLowerer {
       if (!decl) continue;
       if (decl.kind === "FnDecl") {
         let retType = "void";
-        if (decl.returnType) {
+        let returnsBool = false;
+        if (decl.resolvedReturnType) {
+          retType = semanticTypeToLirType(decl.resolvedReturnType);
+          returnsBool = this.isBoolType(decl.resolvedReturnType);
+        } else if (decl.returnType) {
           retType = this.resolveLirType(decl.returnType);
+          returnsBool = this.isBoolType(decl.returnType);
         } else if (this.env && this.env.getFunction) {
           const fnDef = this.env.getFunction(decl.name);
           if (fnDef && fnDef.returnType) {
             retType = semanticTypeToLirType(fnDef.returnType);
+            returnsBool = this.isBoolType(fnDef.returnType);
           }
         }
         this.functionReturnTypes.set(decl.name, retType);
+        this.functionReturnsBool.set(decl.name, returnsBool);
       } else if (decl.kind === "ConstDecl") {
-        const lirType = decl.inferredType
-          ? semanticTypeToLirType(decl.inferredType)
+        const semType = decl.resolvedType || decl.inferredType || null;
+        const lirType = semType
+          ? semanticTypeToLirType(semType)
           : decl.typeAnn
             ? this.resolveLirType(decl.typeAnn)
             : this.inferExprLirType(decl.init, null);
+        const isBool = semType
+          ? this.isBoolType(semType)
+          : decl.typeAnn
+            ? this.isBoolType(decl.typeAnn)
+            : this.isBoolAstExpr(decl.init, null);
         this.globalMap.set(decl.name, {
           name: decl.name,
           type: lirType,
+          isBool,
           decl,
         });
       }
     }
 
-    // Pass 2: Lower top-level constants (if any) and functions
+    // Pass 2: Lower top-level functions
     for (const decl of decls) {
       if (!decl) continue;
       if (decl.kind === "FnDecl") {
@@ -238,7 +358,11 @@ class ModuleLowerer {
   lowerFnDecl(fnDecl) {
     const returnType =
       this.functionReturnTypes.get(fnDecl.name) ||
-      (fnDecl.returnType ? this.resolveLirType(fnDecl.returnType) : "void");
+      (fnDecl.resolvedReturnType
+        ? semanticTypeToLirType(fnDecl.resolvedReturnType)
+        : fnDecl.returnType
+          ? this.resolveLirType(fnDecl.returnType)
+          : "void");
 
     const fnCtx = {
       name: fnDecl.name,
@@ -256,11 +380,16 @@ class ModuleLowerer {
 
     // Register parameters first (localIds 0 .. params.length - 1)
     for (const param of fnDecl.params || []) {
-      const paramType = param.inferredType
-        ? semanticTypeToLirType(param.inferredType)
-        : param.resolvedType
-          ? semanticTypeToLirType(param.resolvedType)
+      const paramType = param.resolvedType
+        ? semanticTypeToLirType(param.resolvedType)
+        : param.inferredType
+          ? semanticTypeToLirType(param.inferredType)
           : this.resolveLirType(param.typeAnn);
+      const isBool = param.resolvedType
+        ? this.isBoolType(param.resolvedType)
+        : param.inferredType
+          ? this.isBoolType(param.inferredType)
+          : this.isBoolType(param.typeAnn);
       const localId = fnCtx.nextLocalId++;
       const isGcRoot = paramType === "gc_ref";
       const shadowSlotIndex = isGcRoot ? fnCtx.nextShadowSlot++ : -1;
@@ -269,6 +398,7 @@ class ModuleLowerer {
         localId,
         name: param.name,
         type: paramType,
+        isBool,
         isParam: true,
         isGcRoot,
         shadowSlotIndex,
@@ -294,7 +424,7 @@ class ModuleLowerer {
     };
   }
 
-  allocLocal(fnCtx, name, lirType) {
+  allocLocal(fnCtx, name, lirType, isBool = false) {
     const localId = fnCtx.nextLocalId++;
     const isGcRoot = lirType === "gc_ref";
     const shadowSlotIndex = isGcRoot ? fnCtx.nextShadowSlot++ : -1;
@@ -303,6 +433,7 @@ class ModuleLowerer {
       localId,
       name,
       type: lirType,
+      isBool: Boolean(isBool),
       isParam: false,
       isGcRoot,
       shadowSlotIndex,
@@ -312,9 +443,9 @@ class ModuleLowerer {
     return desc;
   }
 
-  allocTempLocal(fnCtx, lirType, prefix = "$tmp") {
+  allocTempLocal(fnCtx, lirType, prefix = "$tmp", isBool = false) {
     const tempName = `${prefix}_${fnCtx.nextTempId++}`;
-    return this.allocLocal(fnCtx, tempName, lirType);
+    return this.allocLocal(fnCtx, tempName, lirType, isBool);
   }
 
   pushScope(fnCtx) {
@@ -408,19 +539,26 @@ class ModuleLowerer {
           span: blockStmt.tailExpr.span,
         });
       }
-      const tailLir = this.lowerExpr(blockStmt.tailExpr, fnCtx);
-      if (fnCtx.returnType === "void" || tailLir.type === "void") {
-        out.push({
-          op: "expr",
-          expr: tailLir,
-          span: blockStmt.tailExpr.span,
-        });
+      if (
+        fnCtx.returnType === "void" &&
+        blockStmt.tailExpr.kind === "IfExpr"
+      ) {
+        this.lowerIfExprAsStmtInto(blockStmt.tailExpr, fnCtx, out);
       } else {
-        out.push({
-          op: "return",
-          value: tailLir,
-          span: blockStmt.tailExpr.span,
-        });
+        const tailLir = this.lowerExpr(blockStmt.tailExpr, fnCtx);
+        if (fnCtx.returnType === "void" || tailLir.type === "void") {
+          out.push({
+            op: "expr",
+            expr: tailLir,
+            span: blockStmt.tailExpr.span,
+          });
+        } else {
+          out.push({
+            op: "return",
+            value: tailLir,
+            span: blockStmt.tailExpr.span,
+          });
+        }
       }
     }
     this.popScope(fnCtx);
@@ -444,15 +582,34 @@ class ModuleLowerer {
           span: blockStmt.tailExpr.span,
         });
       }
-      const tailLir = this.lowerExpr(blockStmt.tailExpr, fnCtx);
-      out.push({
-        op: "expr",
-        expr: tailLir,
-        span: blockStmt.tailExpr.span,
-      });
+      if (blockStmt.tailExpr.kind === "IfExpr") {
+        this.lowerIfExprAsStmtInto(blockStmt.tailExpr, fnCtx, out);
+      } else {
+        const tailLir = this.lowerExpr(blockStmt.tailExpr, fnCtx);
+        out.push({
+          op: "expr",
+          expr: tailLir,
+          span: blockStmt.tailExpr.span,
+        });
+      }
     }
     this.popScope(fnCtx);
     return out;
+  }
+
+  lowerIfExprAsStmtInto(ifExpr, fnCtx, out) {
+    const condLir = this.lowerExpr(ifExpr.cond, fnCtx);
+    const thenBody = this.lowerBlockStmts(ifExpr.thenBlock, fnCtx);
+    const elseBody = ifExpr.elseBlock
+      ? this.lowerBlockStmts(ifExpr.elseBlock, fnCtx)
+      : [];
+    out.push({
+      op: "if",
+      cond: condLir,
+      thenBody,
+      elseBody,
+      span: ifExpr.span,
+    });
   }
 
   lowerStmtInto(stmt, fnCtx, out) {
@@ -469,6 +626,10 @@ class ModuleLowerer {
 
     switch (stmt.kind) {
       case "ExprStmt": {
+        if (stmt.expr && stmt.expr.kind === "IfExpr") {
+          this.lowerIfExprAsStmtInto(stmt.expr, fnCtx, out);
+          break;
+        }
         const exprLir = this.lowerExpr(stmt.expr, fnCtx);
         out.push({
           op: "expr",
@@ -480,12 +641,27 @@ class ModuleLowerer {
 
       case "LetStmt": {
         const initLir = this.lowerExpr(stmt.init, fnCtx);
-        const varType = stmt.inferredType
-          ? semanticTypeToLirType(stmt.inferredType)
+        // Note: `infer.js` sets `stmt.resolvedType` to the variable's type and `stmt.inferredType` to `Types.VOID`.
+        const semType =
+          stmt.resolvedType ||
+          (stmt.inferredType &&
+          !(stmt.inferredType.tag === "prim" && stmt.inferredType.name === "void")
+            ? stmt.inferredType
+            : null) ||
+          stmt.init?.inferredType ||
+          null;
+        const varType = semType
+          ? semanticTypeToLirType(semType)
           : stmt.typeAnn
             ? this.resolveLirType(stmt.typeAnn)
             : initLir.type;
-        const localDesc = this.allocLocal(fnCtx, stmt.name, varType);
+        const isBool = semType
+          ? this.isBoolType(semType)
+          : stmt.typeAnn
+            ? this.isBoolType(stmt.typeAnn)
+            : this.isBoolAstExpr(stmt.init, fnCtx);
+
+        const localDesc = this.allocLocal(fnCtx, stmt.name, varType, isBool);
         this.defineVar(fnCtx, stmt.name, localDesc);
         out.push({
           op: "local_set",
@@ -507,24 +683,35 @@ class ModuleLowerer {
           const rhsLir = this.lowerExpr(stmt.value, fnCtx);
           let finalValue = rhsLir;
           if (stmt.op && stmt.op !== "=") {
-            const binOpMap = {
-              "+=": "add",
-              "-=": "sub",
-              "*=": "mul",
-              "/=": "div_s",
-            };
-            const kind = binOpMap[stmt.op] || "add";
-            finalValue = {
-              op: "binop",
-              kind,
-              left: {
-                op: "local_get",
-                localId: localDesc.localId,
-                type: localDesc.type,
-              },
-              right: rhsLir,
+            const lhsGet = {
+              op: "local_get",
+              localId: localDesc.localId,
               type: localDesc.type,
             };
+            if (stmt.op === "+=" && localDesc.type === "gc_ref") {
+              finalValue = {
+                op: "call_builtin",
+                builtin: "str_concat",
+                args: [lhsGet, rhsLir],
+                type: "gc_ref",
+              };
+            } else {
+              const binOpMap = {
+                "+=": "add",
+                "-=": "sub",
+                "*=": "mul",
+                "/=": localDesc.type === "f64" ? "div" : "div_s",
+                "%=": "rem_s",
+              };
+              const kind = binOpMap[stmt.op] || "add";
+              finalValue = {
+                op: "binop",
+                kind,
+                left: lhsGet,
+                right: rhsLir,
+                type: localDesc.type,
+              };
+            }
           }
           out.push({
             op: "local_set",
@@ -612,6 +799,121 @@ class ModuleLowerer {
         break;
       }
 
+      case "ForStmt": {
+        const iterVarName = stmt.iteratorVar || stmt.varName || stmt.name || "i";
+        const iterable = stmt.iterable;
+        const isRange =
+          iterable &&
+          (iterable.kind === "RangeExpr" ||
+            (iterable.kind === "BinaryExpr" && iterable.op === ".."));
+
+        if (isRange) {
+          const startAst = iterable.start || iterable.left;
+          const endAst = iterable.end || iterable.right;
+          const startLir = this.lowerExpr(startAst, fnCtx);
+          const endLir = this.lowerExpr(endAst, fnCtx);
+          const iterType = startLir.type === "i64" ? "i64" : "i32";
+
+          this.pushScope(fnCtx);
+          const iterLocal = this.allocLocal(fnCtx, iterVarName, iterType, false);
+          this.defineVar(fnCtx, iterVarName, iterLocal);
+          const endLocal = this.allocTempLocal(fnCtx, iterType, "$for_end");
+
+          // Initialize `iterLocal = start` and `endLocal = end` before loop
+          out.push({
+            op: "local_set",
+            localId: iterLocal.localId,
+            value: startLir,
+            span: startAst?.span || stmt.span,
+          });
+          out.push({
+            op: "local_set",
+            localId: endLocal.localId,
+            value: endLir,
+            span: endAst?.span || stmt.span,
+          });
+
+          const labelId = fnCtx.nextLabelId++;
+          const breakLabel = `$for_break_${labelId}`;
+          const loopLabel = `$for_loop_${labelId}`;
+          const continueLabel = `$for_cont_${labelId}`;
+
+          fnCtx.loopLabels.push({ breakLabel, continueLabel });
+          const bodyStmts = this.lowerBlockStmts(stmt.body, fnCtx);
+          fnCtx.loopLabels.pop();
+          this.popScope(fnCtx);
+
+          const stepConst =
+            iterType === "i64"
+              ? { op: "const_i64", value: 1n, type: "i64" }
+              : { op: "const_i32", value: 1, type: "i32" };
+
+          out.push({
+            op: "block",
+            label: breakLabel,
+            body: [
+              {
+                op: "loop",
+                label: loopLabel,
+                body: [
+                  {
+                    op: "br_if",
+                    label: breakLabel,
+                    cond: {
+                      op: "binop",
+                      kind: "ge_s",
+                      left: {
+                        op: "local_get",
+                        localId: iterLocal.localId,
+                        type: iterType,
+                      },
+                      right: {
+                        op: "local_get",
+                        localId: endLocal.localId,
+                        type: iterType,
+                      },
+                      type: "i32",
+                    },
+                    span: iterable.span || stmt.span,
+                  },
+                  // Inner block `$for_cont_N` so `continue;` exits this block and still runs `i = i + 1; br $for_loop_N`!
+                  {
+                    op: "block",
+                    label: continueLabel,
+                    body: bodyStmts,
+                    span: stmt.body?.span || stmt.span,
+                  },
+                  {
+                    op: "local_set",
+                    localId: iterLocal.localId,
+                    value: {
+                      op: "binop",
+                      kind: "add",
+                      left: {
+                        op: "local_get",
+                        localId: iterLocal.localId,
+                        type: iterType,
+                      },
+                      right: stepConst,
+                      type: iterType,
+                    },
+                    span: stmt.span,
+                  },
+                  {
+                    op: "br",
+                    label: loopLabel,
+                    span: stmt.span,
+                  },
+                ],
+                span: stmt.span,
+              },
+            ],
+            span: stmt.span,
+          });
+        }
+        break;
+      }
+
       case "BreakStmt": {
         const top = fnCtx.loopLabels[fnCtx.loopLabels.length - 1];
         if (top) {
@@ -650,7 +952,10 @@ class ModuleLowerer {
   inferExprLirType(expr, fnCtx) {
     if (!expr) return "void";
     if (expr.inferredType) {
-      return semanticTypeToLirType(expr.inferredType);
+      const t = unwrapType(expr.inferredType);
+      if (t && t.tag !== "error") {
+        return semanticTypeToLirType(t);
+      }
     }
     switch (expr.kind) {
       case "LiteralExpr":
@@ -664,10 +969,39 @@ class ModuleLowerer {
         if (glob) return glob.type;
         return "i32";
       }
+      case "UnaryExpr": {
+        if (expr.op === "!") return "i32";
+        return this.inferExprLirType(expr.operand, fnCtx);
+      }
+      case "BinaryExpr": {
+        if (COMPARISON_AND_LOGICAL_OPS.has(expr.op)) {
+          return "i32";
+        }
+        return this.inferExprLirType(expr.left, fnCtx);
+      }
+      case "CastExpr":
+        return this.resolveLirType(expr.targetType);
+      case "IfExpr": {
+        if (expr.thenBlock && expr.thenBlock.tailExpr) {
+          return this.inferExprLirType(expr.thenBlock.tailExpr, fnCtx);
+        }
+        if (expr.elseBlock && expr.elseBlock.tailExpr) {
+          return this.inferExprLirType(expr.elseBlock.tailExpr, fnCtx);
+        }
+        return "void";
+      }
+      case "BlockExpr": {
+        if (expr.block && expr.block.tailExpr) {
+          return this.inferExprLirType(expr.block.tailExpr, fnCtx);
+        }
+        return "void";
+      }
       case "CallExpr": {
         if (expr.callee.kind === "IdentExpr") {
           const name = expr.callee.name;
-          if (Object.prototype.hasOwnProperty.call(BUILTIN_RETURN_LIR_TYPES, name)) {
+          if (
+            Object.prototype.hasOwnProperty.call(BUILTIN_RETURN_LIR_TYPES, name)
+          ) {
             return BUILTIN_RETURN_LIR_TYPES[name];
           }
           if (this.functionReturnTypes.has(name)) {
@@ -685,6 +1019,22 @@ class ModuleLowerer {
       default:
         return "i32";
     }
+  }
+
+  /**
+   * Format an argument to `print` or `println`: if the AST argument has semantic type `bool`,
+   * wrap it in `bool_to_string` so Wasm prints `"true"` / `"false"` rather than `1` / `0`.
+   */
+  preparePrintArg(astArg, loweredArg, fnCtx) {
+    if (this.isBoolAstExpr(astArg, fnCtx) && loweredArg.type === "i32") {
+      return {
+        op: "call_builtin",
+        builtin: "bool_to_string",
+        args: [loweredArg],
+        type: "gc_ref",
+      };
+    }
+    return loweredArg;
   }
 
   lowerExpr(expr, fnCtx) {
@@ -762,35 +1112,78 @@ class ModuleLowerer {
       }
 
       case "CallExpr": {
-        const rawArgs = (expr.args || []).map((a) => this.lowerExpr(a, fnCtx));
-        const safeArgs = this.stabilizeExprListForGc(rawArgs, fnCtx);
+        const astArgs = expr.args || [];
+        const rawArgs = astArgs.map((a) => this.lowerExpr(a, fnCtx));
 
         if (expr.callee.kind === "IdentExpr") {
           const fnName = expr.callee.name;
 
           if (BUILTIN_NAMES.has(fnName)) {
-            let finalArgs = safeArgs;
-            // If `println()` is called with 0 arguments, pass an empty string literal
-            if ((fnName === "println" || fnName === "print") && finalArgs.length === 0) {
-              const emptyId = this.internString("");
-              finalArgs = [
-                {
-                  op: "const_string",
-                  stringId: emptyId,
-                  value: "",
-                  type: "gc_ref",
+            if (fnName === "print" || fnName === "println") {
+              if (rawArgs.length === 0) {
+                const emptyId = this.internString("");
+                return {
+                  op: "call_builtin",
+                  builtin: fnName,
+                  args: [
+                    {
+                      op: "const_string",
+                      stringId: emptyId,
+                      value: "",
+                      type: "gc_ref",
+                    },
+                  ],
+                  type: "void",
+                };
+              }
+              const formattedArgs = rawArgs.map((argLir, idx) =>
+                this.preparePrintArg(astArgs[idx], argLir, fnCtx)
+              );
+              if (formattedArgs.length === 1) {
+                return {
+                  op: "call_builtin",
+                  builtin: fnName,
+                  args: formattedArgs,
+                  type: "void",
+                };
+              }
+              // Multi-argument `print(a, b, ...)` / `println(a, b, ...)`
+              const prefixStmts = [];
+              for (let i = 0; i < formattedArgs.length - 1; i++) {
+                prefixStmts.push({
+                  op: "expr",
+                  expr: {
+                    op: "call_builtin",
+                    builtin: "print",
+                    args: [formattedArgs[i]],
+                    type: "void",
+                  },
+                });
+              }
+              return {
+                op: "seq",
+                stmts: prefixStmts,
+                result: {
+                  op: "call_builtin",
+                  builtin: fnName,
+                  args: [formattedArgs[formattedArgs.length - 1]],
+                  type: "void",
                 },
-              ];
+                type: "void",
+              };
             }
+
+            const safeArgs = this.stabilizeExprListForGc(rawArgs, fnCtx);
             const retType = this.inferExprLirType(expr, fnCtx);
             return {
               op: "call_builtin",
               builtin: fnName,
-              args: finalArgs,
+              args: safeArgs,
               type: retType,
             };
           }
 
+          const safeArgs = this.stabilizeExprListForGc(rawArgs, fnCtx);
           const retType = this.inferExprLirType(expr, fnCtx);
           return {
             op: "call",
@@ -800,6 +1193,7 @@ class ModuleLowerer {
           };
         }
 
+        const safeArgs = this.stabilizeExprListForGc(rawArgs, fnCtx);
         const retType = this.inferExprLirType(expr, fnCtx);
         return {
           op: "call",
@@ -810,9 +1204,37 @@ class ModuleLowerer {
       }
 
       case "BinaryExpr": {
+        // Short-circuit logical `&&` and `||` via `if_expr`
+        if (expr.op === "&&") {
+          const cond = this.lowerExpr(expr.left, fnCtx);
+          const right = this.lowerExpr(expr.right, fnCtx);
+          return {
+            op: "if_expr",
+            cond,
+            thenStmts: [],
+            thenExpr: right,
+            elseStmts: [],
+            elseExpr: { op: "const_i32", value: 0, type: "i32" },
+            type: "i32",
+          };
+        }
+        if (expr.op === "||") {
+          const cond = this.lowerExpr(expr.left, fnCtx);
+          const right = this.lowerExpr(expr.right, fnCtx);
+          return {
+            op: "if_expr",
+            cond,
+            thenStmts: [],
+            thenExpr: { op: "const_i32", value: 1, type: "i32" },
+            elseStmts: [],
+            elseExpr: right,
+            type: "i32",
+          };
+        }
+
         const leftRaw = this.lowerExpr(expr.left, fnCtx);
         const rightRaw = this.lowerExpr(expr.right, fnCtx);
-        const [left, right] = this.stabilizeExprListForGc(
+        let [left, right] = this.stabilizeExprListForGc(
           [leftRaw, rightRaw],
           fnCtx
         );
@@ -854,6 +1276,20 @@ class ModuleLowerer {
           }
         }
 
+        // Ensure i64 shift counts match i64 operand type if needed
+        if (
+          (expr.op === "<<" || expr.op === ">>") &&
+          left.type === "i64" &&
+          right.type === "i32"
+        ) {
+          right = {
+            op: "conv",
+            kind: "i32_to_i64",
+            operand: right,
+            type: "i64",
+          };
+        }
+
         const opMap = {
           "+": "add",
           "-": "sub",
@@ -871,10 +1307,10 @@ class ModuleLowerer {
           "^": "xor",
           "<<": "shl",
           ">>": "shr_s",
-          "&&": "and",
-          "||": "or",
         };
-        const resultType = this.inferExprLirType(expr, fnCtx);
+        const resultType = COMPARISON_AND_LOGICAL_OPS.has(expr.op)
+          ? "i32"
+          : left.type;
         return {
           op: "binop",
           kind: opMap[expr.op] || expr.op,
@@ -931,15 +1367,58 @@ class ModuleLowerer {
         return operand;
       }
 
+      case "CastExpr": {
+        const operand = this.lowerExpr(expr.expr, fnCtx);
+        const srcType = operand.type;
+        const dstType = this.resolveLirType(expr.targetType);
+
+        if (srcType === dstType) {
+          // If casting integer to bool (`x as bool`), normalize non-zero to 1
+          if (
+            this.isBoolType(expr.targetType) &&
+            !this.isBoolAstExpr(expr.expr, fnCtx)
+          ) {
+            return {
+              op: "binop",
+              kind: "ne",
+              left: operand,
+              right: { op: "const_i32", value: 0, type: "i32" },
+              type: "i32",
+            };
+          }
+          return operand;
+        }
+
+        const convKey = `${srcType}_to_${dstType}`;
+        const validConvKinds = new Set([
+          "i32_to_i64",
+          "i64_to_i32",
+          "i32_to_f64",
+          "i64_to_f64",
+          "f64_to_i32",
+          "f64_to_i64",
+        ]);
+        if (validConvKinds.has(convKey)) {
+          return {
+            op: "conv",
+            kind: convKey,
+            operand,
+            type: dstType,
+          };
+        }
+        return operand;
+      }
+
       case "BlockExpr": {
         const stmts = [];
         this.pushScope(fnCtx);
         for (const s of expr.block.stmts || []) {
           this.lowerStmtInto(s, fnCtx, stmts);
         }
+        const resultType = this.inferExprLirType(expr, fnCtx);
         const result = expr.block.tailExpr
           ? this.lowerExpr(expr.block.tailExpr, fnCtx)
-          : { op: "const_i32", value: 0, type: "i32" };
+          : defaultConstForLirType(resultType);
         this.popScope(fnCtx);
         if (stmts.length === 0) return result;
         return {
@@ -951,6 +1430,18 @@ class ModuleLowerer {
       }
 
       case "IfExpr": {
+        const resultType = this.inferExprLirType(expr, fnCtx);
+        if (resultType === "void") {
+          const stmts = [];
+          this.lowerIfExprAsStmtInto(expr, fnCtx, stmts);
+          return {
+            op: "seq",
+            stmts,
+            result: { op: "const_i32", value: 0, type: "i32" },
+            type: "i32",
+          };
+        }
+
         const cond = this.lowerExpr(expr.cond, fnCtx);
         const thenStmts = [];
         this.pushScope(fnCtx);
@@ -959,7 +1450,7 @@ class ModuleLowerer {
         }
         const thenExpr = expr.thenBlock.tailExpr
           ? this.lowerExpr(expr.thenBlock.tailExpr, fnCtx)
-          : { op: "const_i32", value: 0, type: "i32" };
+          : defaultConstForLirType(resultType);
         this.popScope(fnCtx);
 
         const elseStmts = [];
@@ -970,10 +1461,9 @@ class ModuleLowerer {
         const elseExpr =
           expr.elseBlock && expr.elseBlock.tailExpr
             ? this.lowerExpr(expr.elseBlock.tailExpr, fnCtx)
-            : { op: "const_i32", value: 0, type: "i32" };
+            : defaultConstForLirType(resultType);
         this.popScope(fnCtx);
 
-        const resultType = this.inferExprLirType(expr, fnCtx);
         return {
           op: "if_expr",
           cond,

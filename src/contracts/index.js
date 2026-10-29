@@ -6,43 +6,34 @@
  */
 
 // ============================================================================
-// 1. Source Spans & Diagnostics
+// 1. Source Spans & Diagnostics (Scoped to M1-M2)
 // ============================================================================
 
 export const ErrorCodes = Object.freeze({
-  // Lexer (E0001 - E0099)
+  // Lexer (E0001 - E0005)
   LEX_UNEXPECTED_CHAR: "E0001",
   LEX_UNTERMINATED_STRING: "E0002",
   LEX_INVALID_ESCAPE: "E0003",
   LEX_INVALID_NUMBER: "E0004",
   LEX_UNTERMINATED_COMMENT: "E0005",
 
-  // Parser (E0101 - E0199)
+  // Parser (E0101 - E0107)
   PARSE_UNEXPECTED_TOKEN: "E0101",
   PARSE_EXPECTED_TOKEN: "E0102",
   PARSE_EXPECTED_EXPR: "E0103",
   PARSE_EXPECTED_TYPE: "E0104",
-  PARSE_EXPECTED_PATTERN: "E0105",
   PARSE_INVALID_ASSIGN_TARGET: "E0106",
   PARSE_EXPECTED_DECL: "E0107",
 
-  // Type Checker (E0201 - E0299)
+  // Type Checker (M1-M2 Scope: E0201 - E0206, E0213, E0214, E0217 - E0223)
   TYPE_MISMATCH: "E0201",
   TYPE_UNDEFINED_VAR: "E0202",
   TYPE_UNDEFINED_TYPE: "E0203",
   TYPE_UNDEFINED_FN: "E0204",
   TYPE_ARITY_MISMATCH: "E0205",
   TYPE_IMMUTABLE_ASSIGN: "E0206",
-  TYPE_UNKNOWN_FIELD: "E0207",
-  TYPE_MISSING_FIELD: "E0208",
-  TYPE_DUPLICATE_FIELD: "E0209",
-  TYPE_UNKNOWN_VARIANT: "E0210",
-  TYPE_NOT_INDEXABLE: "E0211",
-  TYPE_INDEX_NOT_INT: "E0212",
   TYPE_NOT_CALLABLE: "E0213",
   TYPE_INVALID_CAST: "E0214",
-  TYPE_GENERIC_ARITY: "E0215",
-  TYPE_CANNOT_INFER: "E0216",
   TYPE_RETURN_MISMATCH: "E0217",
   TYPE_MISSING_RETURN: "E0218",
   TYPE_BREAK_OUTSIDE_LOOP: "E0219",
@@ -50,17 +41,6 @@ export const ErrorCodes = Object.freeze({
   TYPE_CONDITION_NOT_BOOL: "E0221",
   TYPE_BINARY_OP_MISMATCH: "E0222",
   TYPE_UNARY_OP_MISMATCH: "E0223",
-
-  // Pattern Matching & Exhaustiveness (E0301 - E0399)
-  MATCH_NON_EXHAUSTIVE: "E0301",
-  MATCH_REDUNDANT_ARM: "E0302",
-  MATCH_PATTERN_ARITY: "E0303",
-
-  // Modules & Imports (E0401 - E0499)
-  MOD_NOT_FOUND: "E0401",
-  MOD_SYMBOL_NOT_FOUND: "E0402",
-  MOD_CIRCULAR_IMPORT: "E0403",
-  MOD_PRIVATE_SYMBOL: "E0404",
 });
 
 export function createSpan(
@@ -303,7 +283,7 @@ export class LumenRuntimeError extends Error {
     this.name = "LumenRuntimeError";
     this.lumenMessage = message;
   }
-   format() {
+  format() {
     return `runtime error: ${this.lumenMessage}`;
   }
 }
@@ -320,7 +300,7 @@ export function formatFloat64(val) {
 }
 
 /**
- * Saturating conversion from f64 to i32 (matches Wasm `i32.trunc_sat_f64_s` = 0xfc 0x00).
+ * Saturating conversion from f64 to i32 (matches Wasm `i32.trunc_sat_f64_s` = 0xfc 0x02).
  */
 export function truncSatF64ToI32(val) {
   const n = Number(val);
@@ -331,7 +311,7 @@ export function truncSatF64ToI32(val) {
 }
 
 /**
- * Saturating conversion from f64 to i64 (matches Wasm `i64.trunc_sat_f64_s` = 0xfc 0x02).
+ * Saturating conversion from f64 to i64 (matches Wasm `i64.trunc_sat_f64_s` = 0xfc 0x06).
  */
 export function truncSatF64ToI64(val) {
   const n = Number(val);
@@ -474,18 +454,6 @@ export const GC_FLAGS = Object.freeze({
   PTR_ELEMS: 8,  // Bit 3: for ARRAY/RAW_BUFFER objects, indicates elements are `gc_ref` pointers
 });
 
-/**
- * Canonical Object Layouts (all offsets measured from object start `header = offset 0`):
- * - Header: +0..+7  ([gc_flags: u8, obj_kind: u8, type_desc_id: u16, payload_size: u32])
- * - STRING (1):     +8 = byte_len (u32), +12.. = UTF-8 bytes
- * - ARRAY (2):      +8 = length (u32), +12 = capacity (u32), +16 = data_ptr (gc_ref), +20 = elem_size (u32)
- * - STRUCT (3):     field i at +(8 + 8 * i)
- * - ENUM (4):       variant_tag (i32) at +8 (pad +12..+15), variant field i at +(16 + 8 * i)
- * - CLOSURE_ENV (5):captured variable i at +(8 + 8 * i)
- * - BOX (6):        boxed value at +8
- * - CLOSURE (7):    fn_table_idx (i32) at +8, env_ptr (gc_ref) at +12
- * - RAW_BUFFER (8): +8 = length (u32), +12 = elem_size (u32), elements at +(16 + elem_size * i)
- */
 export const OBJ_KIND = Object.freeze({
   STRING: 1,
   ARRAY: 2,
@@ -498,7 +466,7 @@ export const OBJ_KIND = Object.freeze({
 });
 
 // ============================================================================
-// 5. Built-in Function Names (Including generic `eq<T>` and `hash<T>`)
+// 5. Built-in Function Names
 // ============================================================================
 
 export const BUILTIN_NAMES = new Set([
@@ -520,12 +488,6 @@ export const BUILTIN_NAMES = new Set([
   "str_eq",
   "str_hash",
   "str_to_int",
-  "array_len",
-  "array_push",
-  "array_pop",
-  "array_new",
-  "eq",
-  "hash",
   "sqrt",
   "sin",
   "cos",
@@ -534,10 +496,6 @@ export const BUILTIN_NAMES = new Set([
   "floor",
   "ceil",
   "pow",
-  "gc_collect",
-  "gc_live_bytes",
-  "gc_total_allocated",
-  "gc_collection_count",
   "clock_ms",
   "assert",
   "panic",
@@ -588,9 +546,6 @@ export function assertValidProgramAst(ast) {
   return true;
 }
 
-/**
- * Returns true if evaluating `expr` can trigger a function call or heap allocation.
- */
 export function exprMayAllocOrCall(expr) {
   if (!expr || typeof expr !== "object") return false;
   switch (expr.op) {
@@ -652,11 +607,6 @@ export function stmtMayAllocOrCall(stmt) {
   }
 }
 
-/**
- * Returns true if `expr` is already safely rooted in a local or global (or static constant),
- * meaning it does not produce a fresh unrooted `gc_ref` on the Wasm operand stack, OR is a `seq`
- * whose result is a rooted local/global.
- */
 function isRootedGcExpr(expr) {
   if (!expr) return true;
   if (expr.type !== "gc_ref") return true;
@@ -674,12 +624,6 @@ function isRootedGcExpr(expr) {
   return false;
 }
 
-/**
- * Strictly validates an LIR Module:
- * 1. Rejects any unknown statement or expression `op` name (e.g. catches `" call_builtin"`).
- * 2. Verifies all `mem_load`, `mem_store`, and `pointerOffsets` are >= 8 (measured from header = offset 0).
- * 3. Verifies Rule 10: No unrooted `gc_ref` value sits on the Wasm operand stack across a call or allocation.
- */
 export function validateLir(lirModule) {
   if (
     !lirModule ||
@@ -707,8 +651,6 @@ export function validateLir(lirModule) {
   }
 
   function checkExprListForStackGcSafety(exprs, fnName, contextDesc) {
-    // If exprs[j] (for j > i) can allocate or call, then exprs[i] (if type === "gc_ref")
-    // MUST be a rooted expression (local_get / global_get / const_string), NOT an unrooted call/gc_alloc on the operand stack!
     for (let i = 0; i < exprs.length; i++) {
       const e = exprs[i];
       if (e && e.type === "gc_ref" && !isRootedGcExpr(e)) {
@@ -725,7 +667,7 @@ export function validateLir(lirModule) {
 
   function visitExpr(expr, fnName) {
     if (!expr || typeof expr !== "object") {
-      throw new Error(`Invalid LIR expression in '${fnName}': ${ JSON.stringify(expr) }`);
+      throw new Error(`Invalid LIR expression in '${fnName}': ${JSON.stringify(expr)}`);
     }
     if (!VALID_LIR_EXPR_OPS.has(expr.op)) {
       throw new Error(

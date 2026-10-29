@@ -342,10 +342,66 @@ export function emitWasm(lirModule, options = {}) {
     [WasmValType.I32, WasmValType.I32],
     [WasmValType.I32]
   );
+  const impStrSlice = addHostImport(
+    "__lumen_str_slice",
+    [WasmValType.I32, WasmValType.I32, WasmValType.I32],
+    [WasmValType.I32]
+  );
+  const impStrCharAt = addHostImport(
+    "__lumen_str_char_at",
+    [WasmValType.I32, WasmValType.I32],
+    [WasmValType.I32]
+  );
+  const impStrFromCharCode = addHostImport(
+    "__lumen_str_from_char_code",
+    [WasmValType.I32],
+    [WasmValType.I32]
+  );
   const impStrEq = addHostImport(
     "__lumen_str_eq",
     [WasmValType.I32, WasmValType.I32],
     [WasmValType.I32]
+  );
+  const impStrCmp = addHostImport(
+    "__lumen_str_cmp",
+    [WasmValType.I32, WasmValType.I32],
+    [WasmValType.I32]
+  );
+  const impStrHash = addHostImport(
+    "__lumen_str_hash",
+    [WasmValType.I32],
+    [WasmValType.I32]
+  );
+  const impStrToInt = addHostImport(
+    "__lumen_str_to_int",
+    [WasmValType.I32],
+    [WasmValType.I32]
+  );
+  const impF64Sin = addHostImport(
+    "__lumen_f64_sin",
+    [WasmValType.F64],
+    [WasmValType.F64]
+  );
+  const impF64Cos = addHostImport(
+    "__lumen_f64_cos",
+    [WasmValType.F64],
+    [WasmValType.F64]
+  );
+  const impF64Pow = addHostImport(
+    "__lumen_f64_pow",
+    [WasmValType.F64, WasmValType.F64],
+    [WasmValType.F64]
+  );
+  const impF64Rem = addHostImport(
+    "__lumen_f64_rem",
+    [WasmValType.F64, WasmValType.F64],
+    [WasmValType.F64]
+  );
+  const impClockMs = addHostImport("__lumen_clock_ms", [], [WasmValType.F64]);
+  const impAssertFail = addHostImport(
+    "__lumen_assert_fail",
+    [WasmValType.I32],
+    []
   );
   const impTrap = addHostImport("__lumen_trap", [WasmValType.I32], []);
 
@@ -612,13 +668,26 @@ export function emitWasm(lirModule, options = {}) {
       prescanLocalsInStmt(stmt);
     }
 
-    // Lazily allocated scratch locals for checked division/modulo if needed
-    const scratchLocals = new Map();
-    function getScratchLocal(key, lirType) {
-      if (scratchLocals.has(key)) return scratchLocals.get(key);
-      const idx = allocateLocal(`__scratch_${key}`, `__scratch_${key}`, lirType);
-      scratchLocals.set(key, idx);
-      return idx;
+    // Reusable scratch local pool per LIR type (safe across arbitrary nested expressions)
+    const scratchPoolByType = new Map();
+    let scratchCounter = 0;
+
+    function acquireScratchLocal(lirType) {
+      const pool = scratchPoolByType.get(lirType);
+      if (pool && pool.length > 0) {
+        return pool.pop();
+      }
+      const id = `__scratch_${scratchCounter++}`;
+      return allocateLocal(id, id, lirType);
+    }
+
+    function releaseScratchLocal(lirType, wasmIdx) {
+      let pool = scratchPoolByType.get(lirType);
+      if (!pool) {
+        pool = [];
+        scratchPoolByType.set(lirType, pool);
+      }
+      pool.push(wasmIdx);
     }
 
     function resolveLocalIdx(ref) {
@@ -641,6 +710,7 @@ export function emitWasm(lirModule, options = {}) {
     }
 
     const bodyBuf = new ByteBuffer(256);
+    // Wasm structured control flow stack: EVERY `block`, `loop`, and `if` pushes an entry!
     const labelStack = [];
 
     function resolveBranchDepth(label) {
@@ -722,7 +792,7 @@ export function emitWasm(lirModule, options = {}) {
             break;
           }
 
-          // String concatenation or equality via binop
+          // String concatenation, equality, and lexicographical comparisons
           if (operandType === "gc_ref" && (kind === "+" || kind === "add" || kind === "str_concat")) {
             emitExpr(expr.left);
             emitExpr(expr.right);
@@ -741,24 +811,60 @@ export function emitWasm(lirModule, options = {}) {
             }
             break;
           }
+          if (
+            operandType === "gc_ref" &&
+            (kind === "<" || kind === "lt" || kind === "lt_s" ||
+             kind === "<=" || kind === "le" || kind === "le_s" ||
+             kind === ">" || kind === "gt" || kind === "gt_s" ||
+             kind === ">=" || kind === "ge" || kind === "ge_s")
+          ) {
+            emitExpr(expr.left);
+            emitExpr(expr.right);
+            bodyBuf.writeByte(WasmOp.call).writeU32(impStrCmp);
+            bodyBuf.writeByte(WasmOp.i32_const).writeS32(0);
+            if (kind === "<" || kind === "lt" || kind === "lt_s") {
+              bodyBuf.writeByte(WasmOp.i32_lt_s);
+            } else if (kind === "<=" || kind === "le" || kind === "le_s") {
+              bodyBuf.writeByte(WasmOp.i32_le_s);
+            } else if (kind === ">" || kind === "gt" || kind === "gt_s") {
+              bodyBuf.writeByte(WasmOp.i32_gt_s);
+            } else {
+              bodyBuf.writeByte(WasmOp.i32_ge_s);
+            }
+            break;
+          }
 
-          // Checked i32 division & remainder (Rule 4)
+          // f64 modulo via host helper (Wasm has no native f64.rem opcode)
+          if (
+            operandType === "f64" &&
+            (kind === "%" || kind === "rem" || kind === "rem_s" || kind === "rem_f64")
+          ) {
+            emitExpr(expr.left);
+            emitExpr(expr.right);
+            bodyBuf.writeByte(WasmOp.call).writeU32(impF64Rem);
+            break;
+          }
+
+          // Checked i32 division (Rule 4: trap on / 0 and INT_MIN / -1)
           if (
             (kind === "/" || kind === "div" || kind === "div_s" || kind === "div_i32") &&
             operandType === "i32"
           ) {
-            const lhsLocal = getScratchLocal("div32_a", "i32");
-            const rhsLocal = getScratchLocal("div32_b", "i32");
             emitExpr(expr.left);
-            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
             emitExpr(expr.right);
+            const lhsLocal = acquireScratchLocal("i32");
+            const rhsLocal = acquireScratchLocal("i32");
             bodyBuf.writeByte(WasmOp.local_tee).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i32_eqz);
             bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.VOID);
+            labelStack.push(null);
             emitTrapWithStrId(divZeroStrId);
+            labelStack.pop();
             bodyBuf.writeByte(WasmOp.end);
 
-            // Check INT_MIN / -1
+            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
+
+            // Check INT_MIN / -1 -> trap "integer overflow"
             bodyBuf.writeByte(WasmOp.local_get).writeU32(lhsLocal);
             bodyBuf.writeByte(WasmOp.i32_const).writeS32(-2147483648);
             bodyBuf.writeByte(WasmOp.i32_eq);
@@ -767,53 +873,77 @@ export function emitWasm(lirModule, options = {}) {
             bodyBuf.writeByte(WasmOp.i32_eq);
             bodyBuf.writeByte(WasmOp.i32_and);
             bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.VOID);
+            labelStack.push(null);
             emitTrapWithStrId(overflowStrId);
+            labelStack.pop();
             bodyBuf.writeByte(WasmOp.end);
 
             bodyBuf.writeByte(WasmOp.local_get).writeU32(lhsLocal);
             bodyBuf.writeByte(WasmOp.local_get).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i32_div_s);
+            releaseScratchLocal("i32", rhsLocal);
+            releaseScratchLocal("i32", lhsLocal);
             break;
           }
 
+          // Checked i32 remainder (Rule 4: trap on % 0; INT_MIN % -1 evaluates to 0 without trapping)
           if (
             (kind === "%" || kind === "rem" || kind === "rem_s" || kind === "rem_i32") &&
             operandType === "i32"
           ) {
-            const lhsLocal = getScratchLocal("rem32_a", "i32");
-            const rhsLocal = getScratchLocal("rem32_b", "i32");
             emitExpr(expr.left);
-            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
             emitExpr(expr.right);
+            const lhsLocal = acquireScratchLocal("i32");
+            const rhsLocal = acquireScratchLocal("i32");
             bodyBuf.writeByte(WasmOp.local_tee).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i32_eqz);
             bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.VOID);
+            labelStack.push(null);
             emitTrapWithStrId(divZeroStrId);
+            labelStack.pop();
             bodyBuf.writeByte(WasmOp.end);
 
+            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
+
+            // If rhs == -1, result is 0 (handles INT_MIN % -1 cleanly without trap)
+            bodyBuf.writeByte(WasmOp.local_get).writeU32(rhsLocal);
+            bodyBuf.writeByte(WasmOp.i32_const).writeS32(-1);
+            bodyBuf.writeByte(WasmOp.i32_eq);
+            bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.I32);
+            labelStack.push(null);
+            bodyBuf.writeByte(WasmOp.i32_const).writeS32(0);
+            bodyBuf.writeByte(WasmOp.else);
             bodyBuf.writeByte(WasmOp.local_get).writeU32(lhsLocal);
             bodyBuf.writeByte(WasmOp.local_get).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i32_rem_s);
+            labelStack.pop();
+            bodyBuf.writeByte(WasmOp.end);
+
+            releaseScratchLocal("i32", rhsLocal);
+            releaseScratchLocal("i32", lhsLocal);
             break;
           }
 
-          // Checked i64 division & remainder (Rule 4)
+          // Checked i64 division (Rule 4: trap on / 0n and INT64_MIN / -1n)
           if (
             (kind === "/" || kind === "div" || kind === "div_s" || kind === "div_i64") &&
             operandType === "i64"
           ) {
-            const lhsLocal = getScratchLocal("div64_a", "i64");
-            const rhsLocal = getScratchLocal("div64_b", "i64");
             emitExpr(expr.left);
-            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
             emitExpr(expr.right);
+            const lhsLocal = acquireScratchLocal("i64");
+            const rhsLocal = acquireScratchLocal("i64");
             bodyBuf.writeByte(WasmOp.local_tee).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i64_eqz);
             bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.VOID);
+            labelStack.push(null);
             emitTrapWithStrId(divZeroStrId);
+            labelStack.pop();
             bodyBuf.writeByte(WasmOp.end);
 
-            // Check INT64_MIN / -1n
+            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
+
+            // Check INT64_MIN / -1n -> trap "integer overflow"
             bodyBuf.writeByte(WasmOp.local_get).writeU32(lhsLocal);
             bodyBuf.writeByte(WasmOp.i64_const).writeS64(-9223372036854775808n);
             bodyBuf.writeByte(WasmOp.i64_eq);
@@ -822,39 +952,69 @@ export function emitWasm(lirModule, options = {}) {
             bodyBuf.writeByte(WasmOp.i64_eq);
             bodyBuf.writeByte(WasmOp.i32_and);
             bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.VOID);
+            labelStack.push(null);
             emitTrapWithStrId(overflowStrId);
+            labelStack.pop();
             bodyBuf.writeByte(WasmOp.end);
 
             bodyBuf.writeByte(WasmOp.local_get).writeU32(lhsLocal);
             bodyBuf.writeByte(WasmOp.local_get).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i64_div_s);
+            releaseScratchLocal("i64", rhsLocal);
+            releaseScratchLocal("i64", lhsLocal);
             break;
           }
 
+          // Checked i64 remainder (Rule 4: trap on % 0n; INT64_MIN % -1n evaluates to 0n)
           if (
             (kind === "%" || kind === "rem" || kind === "rem_s" || kind === "rem_i64") &&
             operandType === "i64"
           ) {
-            const lhsLocal = getScratchLocal("rem64_a", "i64");
-            const rhsLocal = getScratchLocal("rem64_b", "i64");
             emitExpr(expr.left);
-            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
             emitExpr(expr.right);
+            const lhsLocal = acquireScratchLocal("i64");
+            const rhsLocal = acquireScratchLocal("i64");
             bodyBuf.writeByte(WasmOp.local_tee).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i64_eqz);
             bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.VOID);
+            labelStack.push(null);
             emitTrapWithStrId(divZeroStrId);
+            labelStack.pop();
             bodyBuf.writeByte(WasmOp.end);
 
+            bodyBuf.writeByte(WasmOp.local_set).writeU32(lhsLocal);
+
+            // If rhs == -1n, result is 0n
+            bodyBuf.writeByte(WasmOp.local_get).writeU32(rhsLocal);
+            bodyBuf.writeByte(WasmOp.i64_const).writeS64(-1n);
+            bodyBuf.writeByte(WasmOp.i64_eq);
+            bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.I64);
+            labelStack.push(null);
+            bodyBuf.writeByte(WasmOp.i64_const).writeS64(0n);
+            bodyBuf.writeByte(WasmOp.else);
             bodyBuf.writeByte(WasmOp.local_get).writeU32(lhsLocal);
             bodyBuf.writeByte(WasmOp.local_get).writeU32(rhsLocal);
             bodyBuf.writeByte(WasmOp.i64_rem_s);
+            labelStack.pop();
+            bodyBuf.writeByte(WasmOp.end);
+
+            releaseScratchLocal("i64", rhsLocal);
+            releaseScratchLocal("i64", lhsLocal);
             break;
           }
 
           // Standard binary operations
           emitExpr(expr.left);
           emitExpr(expr.right);
+          // If i64 shift has an i32 right operand, extend it to i64 so Wasm validation succeeds
+          if (
+            operandType === "i64" &&
+            expr.right?.type === "i32" &&
+            (kind === "<<" || kind === "shl" || kind === "shl_i64" ||
+             kind === ">>" || kind === "shr" || kind === "shr_s" || kind === "shr_i64")
+          ) {
+            bodyBuf.writeByte(WasmOp.i64_extend_i32_u);
+          }
           bodyBuf.writeByte(resolveBinopOpcode(kind, operandType));
           break;
         }
@@ -895,18 +1055,21 @@ export function emitWasm(lirModule, options = {}) {
           emitExpr(expr.operand);
           switch (expr.kind) {
             case "i32_to_i64":
+            case "bool_to_i64":
               bodyBuf.writeByte(WasmOp.i64_extend_i32_s);
               break;
             case "i64_to_i32":
               bodyBuf.writeByte(WasmOp.i32_wrap_i64);
               break;
             case "i32_to_f64":
+            case "bool_to_f64":
               bodyBuf.writeByte(WasmOp.f64_convert_i32_s);
               break;
             case "i64_to_f64":
               bodyBuf.writeByte(WasmOp.f64_convert_i64_s);
               break;
             case "f64_to_i32":
+            case "f64_to_int":
               bodyBuf
                 .writeByte(WasmOp.fc_prefix)
                 .writeU32(WasmOp.i32_trunc_sat_f64_s);
@@ -915,6 +1078,16 @@ export function emitWasm(lirModule, options = {}) {
               bodyBuf
                 .writeByte(WasmOp.fc_prefix)
                 .writeU32(WasmOp.i64_trunc_sat_f64_s);
+              break;
+            case "i32_to_bool":
+              bodyBuf.writeByte(WasmOp.i32_const).writeS32(0);
+              bodyBuf.writeByte(WasmOp.i32_ne);
+              break;
+            case "i32_to_i32":
+            case "i64_to_i64":
+            case "f64_to_f64":
+            case "bool_to_i32":
+            case "bool_to_bool":
               break;
             default:
               throw new Error(`Unknown LIR conv kind '${expr.kind}'`);
@@ -1001,25 +1174,46 @@ export function emitWasm(lirModule, options = {}) {
       }
     }
 
+    function emitPrintSingleArg(arg, withNewline) {
+      emitExpr(arg);
+      const isBool =
+        arg.isBool === true ||
+        arg.semanticType === "bool" ||
+        arg.type === "bool";
+      if (isBool) {
+        bodyBuf.writeByte(WasmOp.call).writeU32(impBoolToStr);
+        bodyBuf
+          .writeByte(WasmOp.call)
+          .writeU32(withNewline ? impPrintlnStr : impPrintStr);
+      } else if (arg.type === "i32") {
+        bodyBuf
+          .writeByte(WasmOp.call)
+          .writeU32(withNewline ? impPrintlnI32 : impPrintI32);
+      } else if (arg.type === "i64") {
+        bodyBuf.writeByte(WasmOp.call).writeU32(impI64ToStr);
+        bodyBuf
+          .writeByte(WasmOp.call)
+          .writeU32(withNewline ? impPrintlnStr : impPrintStr);
+      } else if (arg.type === "f64") {
+        bodyBuf.writeByte(WasmOp.call).writeU32(impF64ToStr);
+        bodyBuf
+          .writeByte(WasmOp.call)
+          .writeU32(withNewline ? impPrintlnStr : impPrintStr);
+      } else {
+        bodyBuf
+          .writeByte(WasmOp.call)
+          .writeU32(withNewline ? impPrintlnStr : impPrintStr);
+      }
+    }
+
     function emitBuiltinCall(expr) {
       const b = expr.builtin;
       const args = expr.args || [];
 
       switch (b) {
         case "print": {
-          if (args.length === 0) break;
-          const arg = args[0];
-          emitExpr(arg);
-          if (arg.type === "i32") {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintI32);
-          } else if (arg.type === "i64") {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impI64ToStr);
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintStr);
-          } else if (arg.type === "f64") {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impF64ToStr);
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintStr);
-          } else {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintStr);
+          for (let i = 0; i < args.length; i++) {
+            emitPrintSingleArg(args[i], false);
           }
           break;
         }
@@ -1032,18 +1226,8 @@ export function emitWasm(lirModule, options = {}) {
             bodyBuf.writeByte(WasmOp.call).writeU32(impPrintlnStr);
             break;
           }
-          const arg = args[0];
-          emitExpr(arg);
-          if (arg.type === "i32") {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintlnI32);
-          } else if (arg.type === "i64") {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impI64ToStr);
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintlnStr);
-          } else if (arg.type === "f64") {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impF64ToStr);
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintlnStr);
-          } else {
-            bodyBuf.writeByte(WasmOp.call).writeU32(impPrintlnStr);
+          for (let i = 0; i < args.length; i++) {
+            emitPrintSingleArg(args[i], i === args.length - 1);
           }
           break;
         }
@@ -1101,10 +1285,38 @@ export function emitWasm(lirModule, options = {}) {
           bodyBuf.writeByte(WasmOp.call).writeU32(impStrConcat);
           break;
 
+        case "str_slice":
+          emitExpr(args[0]);
+          emitExpr(args[1]);
+          emitExpr(args[2]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impStrSlice);
+          break;
+
+        case "str_char_at":
+          emitExpr(args[0]);
+          emitExpr(args[1]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impStrCharAt);
+          break;
+
+        case "str_from_char_code":
+          emitExpr(args[0]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impStrFromCharCode);
+          break;
+
         case "str_eq":
           emitExpr(args[0]);
           emitExpr(args[1]);
           bodyBuf.writeByte(WasmOp.call).writeU32(impStrEq);
+          break;
+
+        case "str_hash":
+          emitExpr(args[0]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impStrHash);
+          break;
+
+        case "str_to_int":
+          emitExpr(args[0]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impStrToInt);
           break;
 
         case "sqrt":
@@ -1112,10 +1324,45 @@ export function emitWasm(lirModule, options = {}) {
           bodyBuf.writeByte(WasmOp.f64_sqrt);
           break;
 
+        case "sin":
+          emitExpr(args[0]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impF64Sin);
+          break;
+
+        case "cos":
+          emitExpr(args[0]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impF64Cos);
+          break;
+
+        case "pow":
+          emitExpr(args[0]);
+          emitExpr(args[1]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impF64Pow);
+          break;
+
         case "abs_f64":
           emitExpr(args[0]);
           bodyBuf.writeByte(WasmOp.f64_abs);
           break;
+
+        case "abs_i32": {
+          emitExpr(args[0]);
+          const tmp = acquireScratchLocal("i32");
+          bodyBuf.writeByte(WasmOp.local_tee).writeU32(tmp);
+          bodyBuf.writeByte(WasmOp.i32_const).writeS32(0);
+          bodyBuf.writeByte(WasmOp.i32_lt_s);
+          bodyBuf.writeByte(WasmOp.if).writeByte(WasmValType.I32);
+          labelStack.push(null);
+          bodyBuf.writeByte(WasmOp.i32_const).writeS32(0);
+          bodyBuf.writeByte(WasmOp.local_get).writeU32(tmp);
+          bodyBuf.writeByte(WasmOp.i32_sub);
+          bodyBuf.writeByte(WasmOp.else);
+          bodyBuf.writeByte(WasmOp.local_get).writeU32(tmp);
+          labelStack.pop();
+          bodyBuf.writeByte(WasmOp.end);
+          releaseScratchLocal("i32", tmp);
+          break;
+        }
 
         case "floor":
           emitExpr(args[0]);
@@ -1125,6 +1372,10 @@ export function emitWasm(lirModule, options = {}) {
         case "ceil":
           emitExpr(args[0]);
           bodyBuf.writeByte(WasmOp.f64_ceil);
+          break;
+
+        case "clock_ms":
+          bodyBuf.writeByte(WasmOp.call).writeU32(impClockMs);
           break;
 
         case "panic":
@@ -1147,18 +1398,16 @@ export function emitWasm(lirModule, options = {}) {
           if (args.length > 1) {
             emitExpr(args[1]);
           } else {
-            bodyBuf
-              .writeByte(WasmOp.i32_const)
-              .writeS32(stringIdToPtr.get(assertFailStrId));
+            bodyBuf.writeByte(WasmOp.i32_const).writeS32(0);
           }
-          bodyBuf.writeByte(WasmOp.call).writeU32(impTrap);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impAssertFail);
           bodyBuf.writeByte(WasmOp.unreachable);
           labelStack.pop();
           bodyBuf.writeByte(WasmOp.end);
           break;
 
         default:
-          throw new Error(`Unsupported builtin '${b}' in M1 emitter`);
+          throw new Error(`Unsupported builtin '${b}' in emitter`);
       }
     }
 
@@ -1276,7 +1525,7 @@ export function emitWasm(lirModule, options = {}) {
             bodyBuf.writeByte(WasmOp.i32_const).writeS32(stmt.line | 0);
             bodyBuf.writeByte(WasmOp.i32_const).writeS32(stmt.col | 0);
             bodyBuf.writeByte(WasmOp.i32_const).writeS32(fnId | 0);
-            bodyBuf.writeByte(WasmOp.i32_const).writeS32(0); // $shadow_fp = 0 in M1
+            bodyBuf.writeByte(WasmOp.i32_const).writeS32(0); // $shadow_fp = 0 in M1/M2
             bodyBuf.writeByte(WasmOp.call).writeU32(impDebugStep);
           }
           break;
@@ -1390,6 +1639,7 @@ function resolveBinopOpcode(kind, operandType) {
         return WasmOp.f64_mul;
       case "/":
       case "div":
+      case "div_s":
       case "div_f64":
         return WasmOp.f64_div;
       case "==":
@@ -1402,18 +1652,22 @@ function resolveBinopOpcode(kind, operandType) {
         return WasmOp.f64_ne;
       case "<":
       case "lt":
+      case "lt_s":
       case "lt_f64":
         return WasmOp.f64_lt;
       case "<=":
       case "le":
+      case "le_s":
       case "le_f64":
         return WasmOp.f64_le;
       case ">":
       case "gt":
+      case "gt_s":
       case "gt_f64":
         return WasmOp.f64_gt;
       case ">=":
       case "ge":
+      case "ge_s":
       case "ge_f64":
         return WasmOp.f64_ge;
     }

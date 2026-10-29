@@ -442,6 +442,23 @@ class Parser {
         return this.parseEnumDecl(isPublic, startTok.span, docComment);
       case TokenKind.CONST:
         return this.parseConstDecl(isPublic, startTok.span, docComment);
+      case TokenKind.RPAREN:
+      case TokenKind.RBRACKET:
+      case TokenKind.RBRACE: {
+        this.addDiag(
+          ErrorCodes.PARSE_UNEXPECTED_TOKEN,
+          `unexpected token \`${tok.lexeme}\``,
+          tok.span,
+          `Remove \`${tok.lexeme}\` or check for matching opening delimiter`
+        );
+        this.advance();
+        return {
+          kind: "ErrorExpr",
+          message: `unexpected token \`${tok.lexeme}\``,
+          span: tok.span,
+        };
+      }
+
       default: {
         this.addDiag(
           ErrorCodes.PARSE_EXPECTED_DECL,
@@ -1325,6 +1342,23 @@ class Parser {
       // Identifier, Struct Literal, Enum Constructor, or Turbofish Call
       case TokenKind.IDENT: {
         return this.parseIdentOrCompoundExpr();
+      }
+
+      case TokenKind.RPAREN:
+      case TokenKind.RBRACKET:
+      case TokenKind.RBRACE: {
+        this.addDiag(
+          ErrorCodes.PARSE_UNEXPECTED_TOKEN,
+          `unexpected token \`${tok.lexeme}\``,
+          tok.span,
+          `Remove \`${tok.lexeme}\` or check for matching opening delimiter`
+        );
+        this.advance();
+        return {
+          kind: "ErrorExpr",
+          message: `unexpected token \`${tok.lexeme}\``,
+          span: tok.span,
+        };
       }
 
       default: {

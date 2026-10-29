@@ -401,6 +401,14 @@ export function tokenize(source, filename = "<input>") {
             const c = advance();
             if (c !== "_") rawDigits += c;
           }
+          // Catch malformed floats with multiple decimal points such as `1.2.3`
+          while (peek() === "." && peek(1) !== "." && isAsciiDigit(peek(1))) {
+            invalidNumber = true;
+            rawDigits += advance(); // .
+            while (pos < len && (isAsciiDigit(peek()) || peek() === "_")) {
+              rawDigits += advance();
+            }
+          }
         }
 
         // Exponent part `e+10` / `E-5`
@@ -424,9 +432,9 @@ export function tokenize(source, filename = "<input>") {
         }
       }
 
-      // Check optional type suffix (`i64`, `L`, `i32`, `f64`, or invalid suffix)
+      // Check optional type suffix (`i64`, `L`, `i32`, `f64`, or invalid suffix/digits)
       let suffix = "";
-      if (isIdentStart(peek())) {
+      if (isIdentContinue(peek())) {
         while (pos < len && isIdentContinue(peek())) {
           suffix += advance();
         }

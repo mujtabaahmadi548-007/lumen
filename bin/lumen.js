@@ -49,8 +49,14 @@ async function main() {
 
     for (let i = 0; i < rest.length; i++) {
       const a = rest[i];
-      if (a === "-o" && i + 1 < rest.length) {
+      if ((a === "-o" || a === "--output") && i + 1 < rest.length) {
         outputFile = rest[++i];
+      } else if (a.startsWith("-o=")) {
+        outputFile = a.slice(3);
+      } else if (a.startsWith("--output=")) {
+        outputFile = a.slice(9);
+      } else if (a.startsWith("-o") && a.length > 2 && !a.startsWith("-O")) {
+        outputFile = a.slice(2);
       } else if (a === "-O0") {
         optLevel = 0;
       } else if (a === "-O1") {
@@ -92,9 +98,11 @@ async function main() {
       ? path.resolve(process.cwd(), outputFile)
       : absInput.replace(/\.lm$/, "") + ".wasm";
 
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, result.wasmBytes);
+    const displayPath = outputFile || path.relative(process.cwd(), outPath);
     console.log(
-      `Compiled ${inputFile} -> ${path.relative(process.cwd(), outPath)} (${result.wasmBytes.length} bytes)`
+      `Compiled ${inputFile} -> ${displayPath} (${result.wasmBytes.length} bytes)`
     );
     process.exit(0);
   }

@@ -1,13 +1,16 @@
 /**
- * Lumen Type Checker — M1 Scope (`src/typechecker/infer.js`)
+ * Lumen Type Checker — M1-M2 Scope (`src/typechecker/infer.js`)
  * Owned exclusively by Agent B.
  *
- * M1 Scope:
- * - Top-level `fn main()` and user functions
- * - `void` return type & primitive types (`string`, `i32`, `i64`, `f64`, `bool`, `void`)
- * - String & primitive literals (`LiteralExpr`)
- * - Built-in calls `print(s: string)` and `println(s: string)` (plus basic M1 built-ins)
- * - Annotates `.inferredType` on all visited expressions matching `src/contracts/index.js`
+ * M2 Scope:
+ * - Primitive types: `i32`, `i64`, `f64`, `bool`, `string`, `void`
+ * - Arithmetic (`+`, `-`, `*`, `/`, `%`, unary `-`), logical (`&&`, `||`, `!`),
+ *   bitwise (`&`, `|`, `^`, `~`, `<<`, `>>`), comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`)
+ * - Casts (`expr as Type`) with conversion suggestions on invalid casts (`E0214`)
+ * - `let` and `let mut`, assignments (`=`, `+=`, `-=`, `*=`, `/=`)
+ * - `if`/`else` (statement and expression), `while`, `for i in a..b` (`RangeExpr`),
+ *   `break`, `continue`, `return`, recursion
+ * - Multi-error recovery integration (`ErrorStmt` / `ErrorExpr` produce `Types.ERROR` without cascading)
  */
 
 import {
@@ -22,16 +25,60 @@ import {
   typeToString,
   typesEqual,
   isErrorType,
+  isPrimitiveType,
   isNumericType,
   isIntegerType,
   isBoolType,
   isStringType,
+  isVoidType,
   isOrderedType,
   unify,
   resetTypeVarCounter,
   findClosestMatch,
 } from "./types.js";
 import { TypeEnv } from "./env.js";
+
+const DEFAULT_SUGGESTIONS = Object.freeze({
+  [ErrorCodes.TYPE_MISMATCH]:
+    "Ensure the expression type matches the expected type annotation",
+  [ErrorCodes.TYPE_UNDEFINED_VAR]:
+    "Declare the variable with `let` before referencing it",
+  [ErrorCodes.TYPE_UNDEFINED_TYPE]:
+    "Use a built-in primitive type (`i32`, `i64`, `f64`, `bool`, `string`, or `void`)",
+  [ErrorCodes.TYPE_UNDEFINED_FN]:
+    "Define the function with `fn` before calling it, or check the function name spelling",
+  [ErrorCodes.TYPE_ARITY_MISMATCH]:
+    "Check the function signature and pass the expected number of arguments",
+  [ErrorCodes.TYPE_IMMUTABLE_ASSIGN]:
+    "Declare the variable with `let mut` so it can be reassigned",
+  [ErrorCodes.TYPE_NOT_CALLABLE]:
+    "Only functions can be called with `(...)`",
+  [ErrorCodes.TYPE_INVALID_CAST]:
+    "Use `as` for numeric/boolean conversions, or built-in functions like `int_to_string` / `str_to_int`",
+  [ErrorCodes.TYPE_RETURN_MISMATCH]:
+    "Ensure the returned expression matches the function's declared return type",
+  [ErrorCodes.TYPE_MISSING_RETURN]:
+    "Add a `return <expr>;` statement or trailing expression on all control-flow paths",
+  [ErrorCodes.TYPE_BREAK_OUTSIDE_LOOP]:
+    "Place `break` and `continue` statements inside a `while` or `for` loop",
+  [ErrorCodes.TYPE_DUPLICATE_SYMBOL]:
+    "Rename or remove the duplicate declaration",
+  [ErrorCodes.TYPE_CONDITION_NOT_BOOL]:
+    "Use a boolean expression (such as `x != 0` or `a < b`) as the condition",
+  [ErrorCodes.TYPE_BINARY_OP_MISMATCH]:
+    "Ensure both operands have compatible types for this binary operator",
+  [ErrorCodes.TYPE_UNARY_OP_MISMATCH]:
+    "Ensure the operand has a valid type for this unary operator",
+});
+
+const M2_PRIMITIVE_TYPE_NAMES = [
+  "i32",
+  "i64",
+  "f64",
+  "bool",
+  "string",
+  "void",
+];
 
 export class TypeChecker {
   constructor(options = {}) {
@@ -44,7 +91,8 @@ export class TypeChecker {
   getSourceLine(span) {
     if (!span) return "";
     const file = span.file || this.filename;
-    const src = this.sourceMap.get(file) || this.sourceMap.get(this.filename) || "";
+    const src =
+      this.sourceMap.get(file) || this.sourceMap.get(this.filename) || "";
     if (!src) return "";
     const lines = src.split(/\r?\n/);
     return lines[(span.startLine || 1) - 1] || "";
@@ -52,6 +100,10 @@ export class TypeChecker {
 
   reportError(code, message, span, suggestion = null) {
     const safeSpan = span || createSpan(this.filename);
+    const nonEmptySuggestion =
+      suggestion && String(suggestion).trim().length > 0
+        ? suggestion
+        : DEFAULT_SUGGESTIONS[code] || "Check the types and declarations here";
     this.diagnostics.push(
       createDiagnostic({
         code,
@@ -59,13 +111,13 @@ export class TypeChecker {
         message,
         span: safeSpan,
         sourceLine: this.getSourceLine(safeSpan),
-        suggestion,
+        suggestion: nonEmptySuggestion,
       })
     );
   }
 
   /**
-   * Resolve a parsed `TypeNode` into a semantic `Type`.
+   * Resolve a parsed `TypeNode` into a semantic `Type` (M2 scope).
    */
   resolveTypeNode(typeNode, scope = null) {
     if (!typeNode) return Types.VOID;
@@ -94,6 +146,9 @@ export class TypeChecker {
           case "()":
             resolved = Types.VOID;
             break;
+          case "_error":
+            resolved = Types.ERROR;
+            break;
           default: {
             if (scope) {
               const tp = scope.lookupTypeParam(name);
@@ -102,12 +157,14 @@ export class TypeChecker {
                 break;
               }
             }
-            const closest = findClosestMatch(name, this.env.getAllTypeNames());
+            const closest = findClosestMatch(name, M2_PRIMITIVE_TYPE_NAMES);
             this.reportError(
               ErrorCodes.TYPE_UNDEFINED_TYPE,
               `unknown type \`${name}\``,
               typeNode.span,
-              closest ? `Did you mean \`${closest}\`?` : null
+              closest
+                ? `Did you mean \`${closest}\`?`
+                : "Use a built-in primitive type (`i32`, `i64`, `f64`, `bool`, `string`, or `void`)"
             );
             resolved = Types.ERROR;
             break;
@@ -149,53 +206,71 @@ export class TypeChecker {
     const declaredFns = new Set();
     const declaredConsts = new Set();
 
-    // Pass 1: Register all top-level function signatures
+    // Pass 1: Register all top-level function signatures (supports recursion & mutual recursion)
     for (const decl of ast.decls) {
-      if (!decl) continue;
-      if (decl.kind === "FnDecl") {
-        if (declaredFns.has(decl.name) || this.env.functions.get(decl.name)?.isBuiltin) {
-          this.reportError(
-            ErrorCodes.TYPE_DUPLICATE_SYMBOL,
-            `duplicate function definition \`${decl.name}\``,
-            decl.span
-          );
-          continue;
-        }
-        declaredFns.add(decl.name);
+      if (!decl || decl.kind !== "FnDecl") continue;
+      if (decl.name === "_error") continue;
 
-        const paramTypes = [];
-        for (const param of decl.params || []) {
-          const pType = this.resolveTypeNode(param.typeAnn, this.env.globalScope);
-          param.resolvedType = pType;
-          paramTypes.push(pType);
-        }
-
-        const returnType = decl.returnType
-          ? this.resolveTypeNode(decl.returnType, this.env.globalScope)
-          : Types.VOID;
-
-        decl.resolvedReturnType = returnType;
-        const entry = this.env.registerFunction({
-          name: decl.name,
-          typeParams: decl.typeParams || [],
-          paramTypes,
-          returnType,
-          isPublic: Boolean(decl.isPublic),
-          decl,
-          span: decl.span,
-        });
-        decl.fnType = entry.fnType;
+      if (
+        declaredFns.has(decl.name) ||
+        this.env.functions.get(decl.name)?.isBuiltin
+      ) {
+        this.reportError(
+          ErrorCodes.TYPE_DUPLICATE_SYMBOL,
+          `duplicate function definition \`${decl.name}\``,
+          decl.span,
+          `Rename or remove the duplicate function \`${decl.name}\``
+        );
+        decl._isDuplicate = true;
+        continue;
       }
+      declaredFns.add(decl.name);
+
+      const paramTypes = [];
+      for (const param of decl.params || []) {
+        const pType = this.resolveTypeNode(
+          param.typeAnn,
+          this.env.globalScope
+        );
+        param.resolvedType = pType;
+        param.inferredType = pType;
+        paramTypes.push(pType);
+      }
+
+      const returnType = decl.returnType
+        ? this.resolveTypeNode(decl.returnType, this.env.globalScope)
+        : Types.VOID;
+
+      decl.resolvedReturnType = returnType;
+      decl.inferredType = returnType;
+      const entry = this.env.registerFunction({
+        name: decl.name,
+        typeParams: decl.typeParams || [],
+        paramTypes,
+        returnType,
+        isPublic: Boolean(decl.isPublic),
+        decl,
+        span: decl.span,
+      });
+      decl.fnType = entry.fnType;
     }
 
     // Pass 2: Typecheck top-level constants
     for (const decl of ast.decls) {
       if (!decl || decl.kind !== "ConstDecl") continue;
-      if (declaredConsts.has(decl.name)) {
+      if (decl.name === "_error") {
+        if (decl.init) {
+          this.inferExpr(decl.init, this.env.globalScope, null);
+        }
+        continue;
+      }
+
+      if (declaredConsts.has(decl.name) || declaredFns.has(decl.name)) {
         this.reportError(
           ErrorCodes.TYPE_DUPLICATE_SYMBOL,
-          `duplicate constant definition \`${decl.name}\``,
-          decl.span
+          `duplicate symbol definition \`${decl.name}\``,
+          decl.span,
+          `Rename or remove the duplicate constant \`${decl.name}\``
         );
         continue;
       }
@@ -204,19 +279,33 @@ export class TypeChecker {
       const expectedType = decl.typeAnn
         ? this.resolveTypeNode(decl.typeAnn, this.env.globalScope)
         : null;
-      const initType = this.inferExpr(decl.init, this.env.globalScope, expectedType);
+      const initType = this.inferExpr(
+        decl.init,
+        this.env.globalScope,
+        expectedType
+      );
 
       let finalType = initType;
       if (expectedType) {
         if (!unify(expectedType, initType)) {
           this.reportError(
             ErrorCodes.TYPE_MISMATCH,
-            `constant \`${decl.name}\` declared as \`${typeToString(expectedType)}\`, but initialized with \`${typeToString(initType)}\``,
-            decl.init?.span || decl.span
+            `constant \`${decl.name}\` has type \`${typeToString(expectedType)}\`, but is initialized with \`${typeToString(initType)}\``,
+            decl.init?.span || decl.span,
+            `Change the type of \`${decl.name}\` to \`${typeToString(initType)}\` or provide a \`${typeToString(expectedType)}\` initializer`
           );
         }
         finalType = expectedType;
+      } else if (isVoidType(initType)) {
+        this.reportError(
+          ErrorCodes.TYPE_MISMATCH,
+          `cannot initialize constant \`${decl.name}\` with \`void\` expression`,
+          decl.init?.span || decl.span,
+          `Initialize \`${decl.name}\` with a non-void value`
+        );
+        finalType = Types.ERROR;
       }
+
       decl.resolvedType = finalType;
       decl.inferredType = finalType;
       this.env.registerConstant({
@@ -242,7 +331,11 @@ export class TypeChecker {
   }
 
   checkFnDecl(decl) {
-    const returnType = decl.resolvedReturnType || Types.VOID;
+    const returnType =
+      decl.resolvedReturnType ||
+      (decl.returnType
+        ? this.resolveTypeNode(decl.returnType, this.env.globalScope)
+        : Types.VOID);
     const fnScope = this.env.globalScope.childFunction(
       returnType,
       decl.typeParams || []
@@ -250,17 +343,21 @@ export class TypeChecker {
 
     const seenParams = new Set();
     for (const param of decl.params || []) {
-      if (seenParams.has(param.name)) {
+      if (param.name !== "_error" && seenParams.has(param.name)) {
         this.reportError(
           ErrorCodes.TYPE_DUPLICATE_SYMBOL,
           `duplicate parameter \`${param.name}\` in function \`${decl.name}\``,
-          param.span
+          param.span,
+          `Give each parameter in \`${decl.name}\` a unique name`
         );
       }
-      seenParams.add(param.name);
+      if (param.name !== "_error") {
+        seenParams.add(param.name);
+      }
       const pType =
         param.resolvedType || this.resolveTypeNode(param.typeAnn, fnScope);
       param.resolvedType = pType;
+      param.inferredType = pType;
       fnScope.define(param.name, pType, {
         mutable: Boolean(param.mutable),
         isParam: true,
@@ -269,47 +366,44 @@ export class TypeChecker {
       });
     }
 
-    // Validate `main` signature in M1 (`fn main()` returns `void` or `i32`)
+    // Validate `main` signature (`fn main()` takes 0 parameters)
     if (decl.name === "main" && (decl.params || []).length > 0) {
       this.reportError(
         ErrorCodes.TYPE_ARITY_MISMATCH,
-        `\`main\` function must not take parameters`,
-        decl.span
+        `\`main\` function must not take parameters, found ${decl.params.length}`,
+        decl.span,
+        "Declare `fn main()` with an empty parameter list"
       );
     }
 
     const bodyType = this.checkBlockStmt(decl.body, fnScope, returnType, false);
 
-    // If function has non-void return type and body relies on tail expression or falls through
-    if (
-      !typesEqual(returnType, Types.VOID) &&
-      !isErrorType(returnType) &&
-      !isErrorType(bodyType)
-    ) {
-      if (decl.body.tailExpr) {
-        if (!unify(returnType, bodyType)) {
+    // Check function return type consistency
+    if (!isVoidType(returnType) && !isErrorType(returnType)) {
+      if (decl.body && decl.body.tailExpr) {
+        if (!isErrorType(bodyType) && !unify(returnType, bodyType)) {
           this.reportError(
             ErrorCodes.TYPE_RETURN_MISMATCH,
             `mismatched return type in function \`${decl.name}\`: expected \`${typeToString(returnType)}\`, found \`${typeToString(bodyType)}\``,
-            decl.body.tailExpr.span || decl.body.span
+            decl.body.tailExpr.span || decl.body.span,
+            `Return a value of type \`${typeToString(returnType)}\` or update \`${decl.name}\` return type to \`-> ${typeToString(bodyType)}\``
           );
         }
       } else if (!this.blockAlwaysReturns(decl.body)) {
         this.reportError(
           ErrorCodes.TYPE_MISSING_RETURN,
-          `function \`${decl.name}\` must return a value of type \`${typeToString(returnType)}\``,
-          decl.span
+          `function \`${decl.name}\` must return a value of type \`${typeToString(returnType)}\` on all control-flow paths`,
+          decl.span,
+          `Add a \`return <expr>;\` statement or trailing expression of type \`${typeToString(returnType)}\` at the end of \`${decl.name}\``
         );
       }
-    } else if (typesEqual(returnType, Types.VOID) && decl.body.tailExpr) {
-      if (!typesEqual(bodyType, Types.VOID) && !isErrorType(bodyType)) {
+    } else if (isVoidType(returnType) && decl.body && decl.body.tailExpr) {
+      if (!isVoidType(bodyType) && !isErrorType(bodyType)) {
         this.reportError(
           ErrorCodes.TYPE_RETURN_MISMATCH,
           `function \`${decl.name}\` has return type \`void\`, but its body returns \`${typeToString(bodyType)}\``,
-          decl.body.tailExpr.span,
-          "Add `;` after the expression or specify a return type `-> " +
-            typeToString(bodyType) +
-            "`"
+          decl.body.tailExpr.span || decl.body.span,
+          `Add \`;\` after the expression or change the function signature to \`fn ${decl.name}(...) -> ${typeToString(bodyType)}\``
         );
       }
     }
@@ -318,33 +412,67 @@ export class TypeChecker {
   blockAlwaysReturns(block) {
     if (!block || block.kind !== "BlockStmt") return false;
     for (const stmt of block.stmts || []) {
-      if (stmt.kind === "ReturnStmt") return true;
-      if (
-        stmt.kind === "IfStmt" &&
-        stmt.elseBranch &&
-        this.stmtAlwaysReturns(stmt.thenBranch) &&
-        this.stmtAlwaysReturns(stmt.elseBranch)
-      ) {
-        return true;
-      }
+      if (this.stmtAlwaysReturns(stmt)) return true;
+      // If statement is an ErrorStmt from syntax error recovery, avoid false-positive missing-return error
+      if (stmt.kind === "ErrorStmt") return true;
+    }
+    if (block.tailExpr) {
+      if (block.tailExpr.kind === "ErrorExpr") return true;
+      if (this.exprAlwaysReturns(block.tailExpr)) return true;
     }
     return false;
   }
 
   stmtAlwaysReturns(stmt) {
     if (!stmt) return false;
-    if (stmt.kind === "BlockStmt") return this.blockAlwaysReturns(stmt);
-    if (stmt.kind === "ReturnStmt") return true;
-    if (stmt.kind === "IfStmt" && stmt.elseBranch) {
+    switch (stmt.kind) {
+      case "ReturnStmt":
+      case "ErrorStmt":
+        return true;
+      case "BlockStmt":
+        return this.blockAlwaysReturns(stmt);
+      case "IfStmt":
+        return Boolean(
+          stmt.elseBranch &&
+            this.stmtAlwaysReturns(stmt.thenBranch) &&
+            this.stmtAlwaysReturns(stmt.elseBranch)
+        );
+      case "ExprStmt":
+        return this.exprAlwaysReturns(stmt.expr);
+      default:
+        return false;
+    }
+  }
+
+  exprAlwaysReturns(expr) {
+    if (!expr) return false;
+    if (expr.kind === "ErrorExpr") return true;
+    if (
+      expr.kind === "CallExpr" &&
+      expr.callee &&
+      expr.callee.kind === "IdentExpr" &&
+      expr.callee.name === "panic"
+    ) {
+      return true;
+    }
+    if (expr.kind === "IfExpr" && expr.elseBlock) {
       return (
-        this.stmtAlwaysReturns(stmt.thenBranch) &&
-        this.stmtAlwaysReturns(stmt.elseBranch)
+        this.blockAlwaysReturns(expr.thenBlock) &&
+        this.blockAlwaysReturns(expr.elseBlock)
       );
+    }
+    if (expr.kind === "BlockExpr") {
+      return this.blockAlwaysReturns(expr.block);
     }
     return false;
   }
 
-  checkBlockStmt(block, parentScope, expectedType = null, createChildScope = true) {
+  checkBlockStmt(
+    block,
+    parentScope,
+    expectedType = null,
+    createChildScope = true
+  ) {
     if (!block) return Types.VOID;
     const scope = createChildScope ? parentScope.child() : parentScope;
 
@@ -365,6 +493,12 @@ export class TypeChecker {
     if (!stmt) return;
 
     switch (stmt.kind) {
+      case "ErrorStmt": {
+        // Parser error recovery node: do not emit cascading type error, continue checking subsequent statements
+        stmt.inferredType = Types.VOID;
+        break;
+      }
+
       case "ExprStmt": {
         this.inferExpr(stmt.expr, scope, null);
         stmt.inferredType = Types.VOID;
@@ -383,21 +517,23 @@ export class TypeChecker {
             this.reportError(
               ErrorCodes.TYPE_MISMATCH,
               `mismatched types in \`let ${stmt.name}\`: expected \`${typeToString(declaredType)}\`, found \`${typeToString(initType)}\``,
-              stmt.init?.span || stmt.span
+              stmt.init?.span || stmt.span,
+              `Change the type annotation to \`${typeToString(initType)}\` or convert the initializer to \`${typeToString(declaredType)}\``
             );
           }
           varType = declaredType;
-        } else if (typesEqual(initType, Types.VOID)) {
+        } else if (isVoidType(initType)) {
           this.reportError(
             ErrorCodes.TYPE_MISMATCH,
             `cannot bind variable \`${stmt.name}\` to \`void\` expression`,
-            stmt.init?.span || stmt.span
+            stmt.init?.span || stmt.span,
+            "Remove the `let` binding and call the `void` expression as a statement"
           );
           varType = Types.ERROR;
         }
 
         stmt.resolvedType = varType;
-        stmt.inferredType = Types.VOID;
+        stmt.inferredType = varType;
         scope.define(stmt.name, varType, {
           mutable: Boolean(stmt.mutable),
           declNode: stmt,
@@ -408,7 +544,7 @@ export class TypeChecker {
 
       case "AssignStmt": {
         const targetType = this.inferExpr(stmt.target, scope, null);
-        if (stmt.target.kind === "IdentExpr") {
+        if (stmt.target && stmt.target.kind === "IdentExpr") {
           const binding = scope.lookup(stmt.target.name, false);
           if (binding && !binding.mutable) {
             this.reportError(
@@ -419,14 +555,57 @@ export class TypeChecker {
             );
           }
         }
+
         const valType = this.inferExpr(stmt.value, scope, targetType);
-        if (!unify(targetType, valType)) {
-          this.reportError(
-            ErrorCodes.TYPE_MISMATCH,
-            `mismatched types in assignment: expected \`${typeToString(targetType)}\`, found \`${typeToString(valType)}\``,
-            stmt.value?.span || stmt.span
-          );
+        const op = stmt.op || "=";
+
+        if (!isErrorType(targetType) && !isErrorType(valType)) {
+          if (op === "=") {
+            if (!unify(targetType, valType)) {
+              this.reportError(
+                ErrorCodes.TYPE_MISMATCH,
+                `mismatched types in assignment: expected \`${typeToString(targetType)}\`, found \`${typeToString(valType)}\``,
+                stmt.value?.span || stmt.span,
+                `Assign a value of type \`${typeToString(targetType)}\``
+              );
+            }
+          } else if (op === "+=") {
+            const validTarget =
+              isNumericType(targetType) || isStringType(targetType);
+            if (!validTarget) {
+              this.reportError(
+                ErrorCodes.TYPE_BINARY_OP_MISMATCH,
+                `compound assignment \`+=\` cannot be applied to type \`${typeToString(targetType)}\``,
+                stmt.span,
+                "Use `+=` only with numeric types (`i32`, `i64`, `f64`) or `string`"
+              );
+            } else if (!unify(targetType, valType)) {
+              this.reportError(
+                ErrorCodes.TYPE_MISMATCH,
+                `mismatched types in \`+=\`: target is \`${typeToString(targetType)}\`, but right-hand side is \`${typeToString(valType)}\``,
+                stmt.value?.span || stmt.span,
+                `Provide a right-hand side of type \`${typeToString(targetType)}\``
+              );
+            }
+          } else if (op === "-=" || op === "*=" || op === "/=") {
+            if (!isNumericType(targetType)) {
+              this.reportError(
+                ErrorCodes.TYPE_BINARY_OP_MISMATCH,
+                `compound assignment \`${op}\` requires a numeric target, found \`${typeToString(targetType)}\``,
+                stmt.span,
+                `Use \`${op}\` only with numeric variables (\`i32\`, \`i64\`, or \`f64\`)`
+              );
+            } else if (!unify(targetType, valType)) {
+              this.reportError(
+                ErrorCodes.TYPE_MISMATCH,
+                `mismatched types in \`${op}\`: target is \`${typeToString(targetType)}\`, but right-hand side is \`${typeToString(valType)}\``,
+                stmt.value?.span || stmt.span,
+                `Provide a right-hand side of type \`${typeToString(targetType)}\``
+              );
+            }
+          }
         }
+
         stmt.inferredType = Types.VOID;
         break;
       }
@@ -435,18 +614,29 @@ export class TypeChecker {
         const expectedRet = scope.returnType || Types.VOID;
         if (stmt.value) {
           const actualRet = this.inferExpr(stmt.value, scope, expectedRet);
-          if (!unify(expectedRet, actualRet)) {
-            this.reportError(
-              ErrorCodes.TYPE_RETURN_MISMATCH,
-              `mismatched return type: expected \`${typeToString(expectedRet)}\`, found \`${typeToString(actualRet)}\``,
-              stmt.value.span || stmt.span
-            );
+          if (!isErrorType(expectedRet) && !isErrorType(actualRet)) {
+            if (isVoidType(expectedRet) && !isVoidType(actualRet)) {
+              this.reportError(
+                ErrorCodes.TYPE_RETURN_MISMATCH,
+                `cannot return a value of type \`${typeToString(actualRet)}\` from a \`void\` function`,
+                stmt.value.span || stmt.span,
+                `Use bare \`return;\` or add \`-> ${typeToString(actualRet)}\` to the function signature`
+              );
+            } else if (!unify(expectedRet, actualRet)) {
+              this.reportError(
+                ErrorCodes.TYPE_RETURN_MISMATCH,
+                `mismatched return type: expected \`${typeToString(expectedRet)}\`, found \`${typeToString(actualRet)}\``,
+                stmt.value.span || stmt.span,
+                `Return an expression of type \`${typeToString(expectedRet)}\``
+              );
+            }
           }
-        } else if (!typesEqual(expectedRet, Types.VOID)) {
+        } else if (!isVoidType(expectedRet) && !isErrorType(expectedRet)) {
           this.reportError(
             ErrorCodes.TYPE_RETURN_MISMATCH,
-            `expected return value of type \`${typeToString(expectedRet)}\`, found \`void\``,
-            stmt.span
+            `expected return value of type \`${typeToString(expectedRet)}\`, found bare \`return\``,
+            stmt.span,
+            `Return a value of type \`${typeToString(expectedRet)}\`: \`return <expr>;\``
           );
         }
         stmt.inferredType = Types.VOID;
@@ -459,7 +649,8 @@ export class TypeChecker {
           this.reportError(
             ErrorCodes.TYPE_CONDITION_NOT_BOOL,
             `\`if\` condition must be \`bool\`, found \`${typeToString(condType)}\``,
-            stmt.cond?.span || stmt.span
+            stmt.cond?.span || stmt.span,
+            "Use a boolean condition such as `x != 0` or `x > 0`"
           );
         }
         this.checkBlockStmt(stmt.thenBranch, scope, null, true);
@@ -480,12 +671,45 @@ export class TypeChecker {
           this.reportError(
             ErrorCodes.TYPE_CONDITION_NOT_BOOL,
             `\`while\` condition must be \`bool\`, found \`${typeToString(condType)}\``,
-            stmt.cond?.span || stmt.span
+            stmt.cond?.span || stmt.span,
+            "Use a boolean condition such as `i < n`"
           );
         }
         const loopScope = scope.childLoop();
         this.checkBlockStmt(stmt.body, loopScope, null, false);
         stmt.inferredType = Types.VOID;
+        break;
+      }
+
+      case "ForStmt": {
+        const iterExpr = stmt.iterable;
+        const iterType = this.inferExpr(iterExpr, scope, null);
+        let elemType = Types.I32;
+
+        if (iterExpr && iterExpr.kind === "RangeExpr") {
+          elemType = Types.I32;
+        } else if (!isErrorType(iterType)) {
+          this.reportError(
+            ErrorCodes.TYPE_MISMATCH,
+            `\`for\` loop in M2 expects a range \`start..end\`, found \`${typeToString(iterType)}\``,
+            iterExpr?.span || stmt.span,
+            `Use an integer range expression such as \`for ${stmt.iteratorVar} in 0..10 { ... }\``
+          );
+          elemType = Types.ERROR;
+        } else {
+          elemType = Types.ERROR;
+        }
+
+        stmt.iteratorType = elemType;
+        stmt.inferredType = Types.VOID;
+
+        const loopScope = scope.childLoop();
+        loopScope.define(stmt.iteratorVar, elemType, {
+          mutable: Boolean(stmt.mutable),
+          declNode: stmt,
+          span: stmt.span,
+        });
+        this.checkBlockStmt(stmt.body, loopScope, null, false);
         break;
       }
 
@@ -496,7 +720,8 @@ export class TypeChecker {
           this.reportError(
             ErrorCodes.TYPE_BREAK_OUTSIDE_LOOP,
             `\`${kw}\` cannot be used outside of a loop`,
-            stmt.span
+            stmt.span,
+            `Move \`${kw}\` inside a \`while\` or \`for\` loop, or use \`return\` to exit a function`
           );
         }
         stmt.inferredType = Types.VOID;
@@ -523,6 +748,12 @@ export class TypeChecker {
     let resultType = Types.VOID;
 
     switch (expr.kind) {
+      case "ErrorExpr": {
+        // Parser error recovery node: suppress cascading errors
+        resultType = Types.ERROR;
+        break;
+      }
+
       case "LiteralExpr": {
         switch (expr.literalType) {
           case "string":
@@ -548,7 +779,35 @@ export class TypeChecker {
         break;
       }
 
+      case "RangeExpr": {
+        const startType = this.inferExpr(expr.start, scope, Types.I32);
+        const endType = this.inferExpr(expr.end, scope, Types.I32);
+        if (!isPrimitiveType(startType, "i32") && !isErrorType(startType)) {
+          this.reportError(
+            ErrorCodes.TYPE_MISMATCH,
+            `range start bound must be \`i32\`, found \`${typeToString(startType)}\``,
+            expr.start?.span || expr.span,
+            "Provide an `i32` start value for the range `start..end`"
+          );
+        }
+        if (!isPrimitiveType(endType, "i32") && !isErrorType(endType)) {
+          this.reportError(
+            ErrorCodes.TYPE_MISMATCH,
+            `range end bound must be \`i32\`, found \`${typeToString(endType)}\``,
+            expr.end?.span || expr.span,
+            "Provide an `i32` end value for the range `start..end`"
+          );
+        }
+        expr.elemType = Types.I32;
+        resultType = Types.I32;
+        break;
+      }
+
       case "IdentExpr": {
+        if (expr.name === "_error") {
+          resultType = Types.ERROR;
+          break;
+        }
         const binding = scope.lookup(expr.name);
         if (binding) {
           resultType = unwrapType(binding.type);
@@ -561,13 +820,15 @@ export class TypeChecker {
         }
         const closest = findClosestMatch(
           expr.name,
-          this.env.getAllValueNames(scope)
+          scope.collectVisibleNames()
         );
         this.reportError(
           ErrorCodes.TYPE_UNDEFINED_VAR,
           `undefined variable \`${expr.name}\``,
           expr.span,
-          closest ? `Did you mean \`${closest}\`?` : null
+          closest
+            ? `Did you mean \`${closest}\`?`
+            : `Declare \`${expr.name}\` with \`let ${expr.name} = ...;\` before using it`
         );
         resultType = Types.ERROR;
         break;
@@ -589,7 +850,8 @@ export class TypeChecker {
             this.reportError(
               ErrorCodes.TYPE_UNARY_OP_MISMATCH,
               `unary \`-\` cannot be applied to type \`${typeToString(opType)}\``,
-              expr.span
+              expr.span,
+              "Unary `-` can only be applied to numeric types (`i32`, `i64`, or `f64`)"
             );
             resultType = Types.ERROR;
           } else {
@@ -600,7 +862,10 @@ export class TypeChecker {
             this.reportError(
               ErrorCodes.TYPE_UNARY_OP_MISMATCH,
               `logical \`!\` requires \`bool\` operand, found \`${typeToString(opType)}\``,
-              expr.span
+              expr.span,
+              isIntegerType(opType)
+                ? "Use `~` for bitwise NOT on integers, or `expr == 0` for boolean comparison"
+                : "Logical `!` requires a `bool` operand"
             );
             resultType = Types.ERROR;
           } else {
@@ -610,8 +875,11 @@ export class TypeChecker {
           if (!isIntegerType(opType)) {
             this.reportError(
               ErrorCodes.TYPE_UNARY_OP_MISMATCH,
-              `bitwise \`~\` requires integer operand, found \`${typeToString(opType)}\``,
-              expr.span
+              `bitwise \`~\` requires integer operand (\`i32\` or \`i64\`), found \`${typeToString(opType)}\``,
+              expr.span,
+              isBoolType(opType)
+                ? "Use `!` for logical NOT on `bool`"
+                : "Bitwise `~` can only be applied to `i32` or `i64` integers"
             );
             resultType = Types.ERROR;
           } else {
@@ -637,7 +905,8 @@ export class TypeChecker {
           this.reportError(
             ErrorCodes.TYPE_CONDITION_NOT_BOOL,
             `\`if\` condition must be \`bool\`, found \`${typeToString(condType)}\``,
-            expr.cond?.span || expr.span
+            expr.cond?.span || expr.span,
+            "Use a boolean condition such as `x != 0` or `x > 0`"
           );
         }
         const thenType = this.checkBlockStmt(
@@ -647,18 +916,26 @@ export class TypeChecker {
           true
         );
         const elseType = expr.elseBlock
-          ? this.checkBlockStmt(expr.elseBlock, scope, expectedType || thenType, true)
+          ? this.checkBlockStmt(
+              expr.elseBlock,
+              scope,
+              expectedType || thenType,
+              true
+            )
           : Types.VOID;
 
-        if (!unify(thenType, elseType)) {
+        if (!isErrorType(thenType) && !isErrorType(elseType) && !unify(thenType, elseType)) {
           this.reportError(
             ErrorCodes.TYPE_MISMATCH,
             `\`if\` and \`else\` branches have incompatible types: \`${typeToString(thenType)}\` vs \`${typeToString(elseType)}\``,
-            expr.span
+            expr.span,
+            `Ensure both \`if\` and \`else\` branches return \`${typeToString(thenType)}\``
           );
           resultType = Types.ERROR;
         } else {
-          resultType = unwrapType(thenType);
+          resultType = isErrorType(thenType)
+            ? unwrapType(elseType)
+            : unwrapType(thenType);
         }
         break;
       }
@@ -671,24 +948,36 @@ export class TypeChecker {
           break;
         }
         const validCast =
-          typesEqual(srcType, targetType) ||
+          (!isVoidType(srcType) && typesEqual(srcType, targetType)) ||
           (isNumericType(srcType) && isNumericType(targetType)) ||
-          (isBoolType(srcType) && isIntegerType(targetType));
+          (isBoolType(srcType) && isNumericType(targetType));
+
         if (!validCast) {
+          let suggestion =
+            "Use `as` only to cast numeric or boolean values to `i32`, `i64`, or `f64`";
+          if (isStringType(srcType) && isIntegerType(targetType)) {
+            suggestion = "Use `str_to_int(expr)` to convert a `string` to `i32`";
+          } else if (isPrimitiveType(srcType, "i32") && isStringType(targetType)) {
+            suggestion = "Use `int_to_string(expr)` to convert `i32` to `string`";
+          } else if (isPrimitiveType(srcType, "i64") && isStringType(targetType)) {
+            suggestion = "Use `i64_to_string(expr)` to convert `i64` to `string`";
+          } else if (isPrimitiveType(srcType, "f64") && isStringType(targetType)) {
+            suggestion = "Use `float_to_string(expr)` to convert `f64` to `string`";
+          } else if (isBoolType(srcType) && isStringType(targetType)) {
+            suggestion = "Use `bool_to_string(expr)` to convert `bool` to `string`";
+          } else if (isNumericType(srcType) && isBoolType(targetType)) {
+            suggestion = "Use a comparison like `expr != 0` instead of casting to `bool`";
+          }
           this.reportError(
             ErrorCodes.TYPE_INVALID_CAST,
             `cannot cast \`${typeToString(srcType)}\` to \`${typeToString(targetType)}\``,
-            expr.span
+            expr.span,
+            suggestion
           );
           resultType = Types.ERROR;
         } else {
           resultType = targetType;
         }
-        break;
-      }
-
-      case "ErrorExpr": {
-        resultType = Types.ERROR;
         break;
       }
 
@@ -708,6 +997,14 @@ export class TypeChecker {
     // Direct named function or built-in call
     if (expr.callee && expr.callee.kind === "IdentExpr") {
       const fnName = expr.callee.name;
+      if (fnName === "_error") {
+        for (const arg of args) {
+          this.inferExpr(arg, scope, null);
+        }
+        expr.callee.inferredType = Types.ERROR;
+        return Types.ERROR;
+      }
+
       const localBinding = scope.lookup(fnName);
 
       if (!localBinding) {
@@ -724,7 +1021,9 @@ export class TypeChecker {
             ErrorCodes.TYPE_UNDEFINED_FN,
             `undefined function \`${fnName}\``,
             expr.callee.span || expr.span,
-            closest ? `Did you mean \`${closest}\`?` : null
+            closest
+              ? `Did you mean \`${closest}\`?`
+              : `Define \`fn ${fnName}(...) { ... }\` before calling it`
           );
           expr.callee.inferredType = Types.ERROR;
           return Types.ERROR;
@@ -748,9 +1047,12 @@ export class TypeChecker {
           this.reportError(
             ErrorCodes.TYPE_ARITY_MISMATCH,
             `function \`${fnName}\` expects ${expectedCountStr} argument(s), but ${args.length} were provided`,
-            expr.span
+            expr.span,
+            `Pass ${expectedCountStr} argument(s) when calling \`${fnName}\``
           );
-          return fnDef.isDiverging ? (expectedType || Types.VOID) : fnDef.returnType;
+          return fnDef.isDiverging
+            ? expectedType || Types.VOID
+            : fnDef.returnType;
         }
 
         // Polymorphic `print` and `println`
@@ -759,11 +1061,12 @@ export class TypeChecker {
           for (const arg of args) {
             const argType = this.inferExpr(arg, scope, null);
             resolvedArgTypes.push(argType);
-            if (typesEqual(argType, Types.VOID)) {
+            if (isVoidType(argType)) {
               this.reportError(
                 ErrorCodes.TYPE_MISMATCH,
                 `cannot pass \`void\` expression to \`${fnName}\``,
-                arg.span || expr.span
+                arg.span || expr.span,
+                `Pass a printable value (\`string\`, \`i32\`, \`i64\`, \`f64\`, or \`bool\`) to \`${fnName}\``
               );
             }
           }
@@ -778,7 +1081,8 @@ export class TypeChecker {
             this.reportError(
               ErrorCodes.TYPE_MISMATCH,
               `first argument to \`assert\` must be \`bool\`, found \`${typeToString(condType)}\``,
-              args[0].span
+              args[0].span,
+              "Pass a boolean condition as the first argument to `assert`"
             );
           }
           if (args.length >= 2) {
@@ -787,7 +1091,8 @@ export class TypeChecker {
               this.reportError(
                 ErrorCodes.TYPE_MISMATCH,
                 `second argument to \`assert\` must be \`string\`, found \`${typeToString(msgType)}\``,
-                args[1].span
+                args[1].span,
+                "Pass a `string` error message as the second argument to `assert`"
               );
             }
           }
@@ -801,7 +1106,8 @@ export class TypeChecker {
             this.reportError(
               ErrorCodes.TYPE_MISMATCH,
               `argument to \`panic\` must be \`string\`, found \`${typeToString(msgType)}\``,
-              args[0].span
+              args[0].span,
+              "Pass a `string` message to `panic(\"...\")`"
             );
           }
           return expectedType || Types.VOID;
@@ -811,11 +1117,12 @@ export class TypeChecker {
         for (let i = 0; i < args.length; i++) {
           const paramType = fnDef.paramTypes[i];
           const argType = this.inferExpr(args[i], scope, paramType);
-          if (!unify(paramType, argType)) {
+          if (!isErrorType(paramType) && !isErrorType(argType) && !unify(paramType, argType)) {
             this.reportError(
               ErrorCodes.TYPE_MISMATCH,
               `argument ${i + 1} to \`${fnName}\` has incompatible type: expected \`${typeToString(paramType)}\`, found \`${typeToString(argType)}\``,
-              args[i].span || expr.span
+              args[i].span || expr.span,
+              `Pass a value of type \`${typeToString(paramType)}\` for argument ${i + 1} of \`${fnName}\``
             );
           }
         }
@@ -824,7 +1131,7 @@ export class TypeChecker {
       }
     }
 
-    // First-class function / variable callee
+    // Variable / expression callee
     const calleeType = this.inferExpr(expr.callee, scope, null);
     if (isErrorType(calleeType)) {
       for (const arg of args) {
@@ -840,7 +1147,8 @@ export class TypeChecker {
       this.reportError(
         ErrorCodes.TYPE_NOT_CALLABLE,
         `expression of type \`${typeToString(calleeType)}\` is not callable`,
-        expr.callee?.span || expr.span
+        expr.callee?.span || expr.span,
+        `Remove the call parentheses \`(...)\` or call a function instead of a \`${typeToString(calleeType)}\` value`
       );
       return Types.ERROR;
     }
@@ -852,7 +1160,8 @@ export class TypeChecker {
       this.reportError(
         ErrorCodes.TYPE_ARITY_MISMATCH,
         `callable expects ${calleeType.params.length} argument(s), but ${args.length} were provided`,
-        expr.span
+        expr.span,
+        `Pass ${calleeType.params.length} argument(s) to this function`
       );
       return unwrapType(calleeType.ret);
     }
@@ -860,11 +1169,12 @@ export class TypeChecker {
     for (let i = 0; i < args.length; i++) {
       const paramType = calleeType.params[i];
       const argType = this.inferExpr(args[i], scope, paramType);
-      if (!unify(paramType, argType)) {
+      if (!isErrorType(paramType) && !isErrorType(argType) && !unify(paramType, argType)) {
         this.reportError(
           ErrorCodes.TYPE_MISMATCH,
           `argument ${i + 1} has incompatible type: expected \`${typeToString(paramType)}\`, found \`${typeToString(argType)}\``,
-          args[i].span || expr.span
+          args[i].span || expr.span,
+          `Pass a value of type \`${typeToString(paramType)}\` for argument ${i + 1}`
         );
       }
     }
@@ -888,7 +1198,8 @@ export class TypeChecker {
         this.reportError(
           ErrorCodes.TYPE_BINARY_OP_MISMATCH,
           `logical operator \`${op}\` requires \`bool\` operands, found \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\``,
-          expr.span
+          expr.span,
+          `Convert both operands of \`${op}\` to \`bool\` expressions`
         );
         return Types.ERROR;
       }
@@ -897,11 +1208,12 @@ export class TypeChecker {
 
     // Equality operators `==`, `!=`
     if (op === "==" || op === "!=") {
-      if (!unify(leftType, rightType)) {
+      if (isVoidType(leftType) || isVoidType(rightType) || !unify(leftType, rightType)) {
         this.reportError(
           ErrorCodes.TYPE_BINARY_OP_MISMATCH,
           `cannot compare \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\` with \`${op}\``,
-          expr.span
+          expr.span,
+          `Ensure both sides of \`${op}\` have the same non-void type`
         );
         return Types.ERROR;
       }
@@ -914,7 +1226,8 @@ export class TypeChecker {
         this.reportError(
           ErrorCodes.TYPE_BINARY_OP_MISMATCH,
           `relational operator \`${op}\` cannot be applied to \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\``,
-          expr.span
+          expr.span,
+          `Use matching ordered types (\`i32\`, \`i64\`, \`f64\`, or \`string\`) with \`${op}\``
         );
         return Types.ERROR;
       }
@@ -929,10 +1242,19 @@ export class TypeChecker {
       if (isNumericType(leftType) && unify(leftType, rightType)) {
         return unwrapType(leftType);
       }
+      let suggestion =
+        "Use matching numeric types (`i32`, `i64`, `f64`) or `string + string`";
+      if (isStringType(leftType) || isStringType(rightType)) {
+        suggestion =
+          "Convert non-string operand to `string` with `int_to_string`, `float_to_string`, or `bool_to_string` before concatenating";
+      } else if (isNumericType(leftType) && isNumericType(rightType)) {
+        suggestion = `Cast one operand with \`as ${typeToString(leftType)}\` so both operands have the same numeric type`;
+      }
       this.reportError(
         ErrorCodes.TYPE_BINARY_OP_MISMATCH,
         `operator \`+\` cannot be applied to \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\``,
-        expr.span
+        expr.span,
+        suggestion
       );
       return Types.ERROR;
     }
@@ -942,10 +1264,15 @@ export class TypeChecker {
       if (isNumericType(leftType) && unify(leftType, rightType)) {
         return unwrapType(leftType);
       }
+      const suggestion =
+        isNumericType(leftType) && isNumericType(rightType)
+          ? `Cast one operand with \`as ${typeToString(leftType)}\` so both sides have the same numeric type`
+          : `Operator \`${op}\` requires matching numeric operands (\`i32\`, \`i64\`, or \`f64\`)`;
       this.reportError(
         ErrorCodes.TYPE_BINARY_OP_MISMATCH,
         `arithmetic operator \`${op}\` cannot be applied to \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\``,
-        expr.span
+        expr.span,
+        suggestion
       );
       return Types.ERROR;
     }
@@ -957,8 +1284,9 @@ export class TypeChecker {
       }
       this.reportError(
         ErrorCodes.TYPE_BINARY_OP_MISMATCH,
-        `bitwise operator \`${op}\` requires matching integer operands, found \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\``,
-        expr.span
+        `bitwise operator \`${op}\` requires matching integer operands (\`i32\` or \`i64\`), found \`${typeToString(leftType)}\` and \`${typeToString(rightType)}\``,
+        expr.span,
+        `Use \`i32\` or \`i64\` operands of the same width with bitwise \`${op}\``
       );
       return Types.ERROR;
     }

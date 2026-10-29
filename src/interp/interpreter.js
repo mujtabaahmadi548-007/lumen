@@ -263,7 +263,14 @@ export function interpret(programAst, options = {}) {
   function isF64Expr(expr, scope) {
     if (!expr) return false;
     if (hasSemanticType(expr, "f64")) return true;
-    if (hasSemanticType(expr, "i32") || hasSemanticType(expr, "i64")) return false;
+    if (
+      hasSemanticType(expr, "i32") ||
+      hasSemanticType(expr, "i64") ||
+      hasSemanticType(expr, "bool") ||
+      hasSemanticType(expr, "string")
+    ) {
+      return false;
+    }
 
     switch (expr.kind) {
       case "LiteralExpr":
@@ -471,14 +478,20 @@ export function interpret(programAst, options = {}) {
         // Rule 3: Arguments (including structs, arrays, strings) are passed by shared reference
         fnScope.define(paramName, args[i], Boolean(declParam?.mutable), tag);
       }
+      const retTag = getTypeNodeTag(fnVal.fnDecl?.returnType);
+      const isVoidFn =
+        fnVal.fnDecl && (!fnVal.fnDecl.returnType || retTag === "void");
       try {
+        let res;
         if (fnVal.body.kind === "BlockStmt") {
-          return execBlock(fnVal.body, fnScope, false);
+          res = execBlock(fnVal.body, fnScope, false);
+        } else {
+          res = evalExpr(fnVal.body, fnScope);
         }
-        return evalExpr(fnVal.body, fnScope);
+        return isVoidFn ? null : res;
       } catch (sig) {
         if (sig instanceof ReturnSignal) {
-          return sig.value;
+          return isVoidFn ? null : sig.value;
         }
         throw sig;
       } finally {
@@ -1009,6 +1022,12 @@ export function interpret(programAst, options = {}) {
 
     switch (expr.kind) {
       case "LiteralExpr": {
+        if (hasSemanticType(expr, "i64")) {
+          return toI64(expr.value);
+        }
+        if (hasSemanticType(expr, "f64")) {
+          return toF64(expr.value);
+        }
         const lt = expr.literalType || expr.type;
         switch (lt) {
           case "i32":
@@ -1105,7 +1124,10 @@ export function interpret(programAst, options = {}) {
           const end = evalExpr(expr.right, scope);
           return createRange(start, end, op === "..=");
         }
-        const forceF64 = isF64Expr(expr, scope);
+        const forceF64 =
+          isF64Expr(expr, scope) ||
+          isF64Expr(expr.left, scope) ||
+          isF64Expr(expr.right, scope);
         const leftVal = evalExpr(expr.left, scope);
         const rightVal = evalExpr(expr.right, scope);
         return applyBinaryOp(op, leftVal, rightVal, forceF64);
@@ -1142,7 +1164,8 @@ export function interpret(programAst, options = {}) {
       }
 
       case "CastExpr": {
-        const val = evalExpr(expr.expr || expr.operand, scope);
+        const srcExpr = expr.expr || expr.operand;
+        const val = evalExpr(srcExpr, scope);
         const targetName =
           getTypeNodeTag(expr.targetType) ||
           unwrapType(expr.inferredType)?.name;
@@ -1150,6 +1173,9 @@ export function interpret(programAst, options = {}) {
           case "i32":
             return castToI32(val);
           case "i64":
+            if (hasSemanticType(srcExpr, "i32")) {
+              return BigInt(val | 0);
+            }
             return castToI64(val);
           case "f64":
             return toF64(val);

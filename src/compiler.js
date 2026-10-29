@@ -18,7 +18,7 @@ import { interpret } from "./interp/interpreter.js";
 
 /**
  * Compile Lumen source code through the pipeline:
- * Lex -> Parse -> Typecheck -> LIR -> validateLir() -> Wasm Emit.
+ * Lex -> Parse (with Error Recovery) -> Typecheck (runs even on recovered AST) -> LIR -> validateLir() -> Wasm Emit.
  */
 export function compileSource(source, options = {}) {
   const filename = options.filename || "<input>";
@@ -41,24 +41,24 @@ export function compileSource(source, options = {}) {
     };
   }
 
-  // 2. Parser
+  // 2. Parser (with Error Recovery: produces recovered AST even when syntax errors occur)
   const parseResult = parse(lexResult.tokens, filename, source);
   const allDiagnostics = [...lexResult.diagnostics, ...parseResult.diagnostics];
 
-  if (!parseResult.ast || allDiagnostics.some((d) => d.severity === "error")) {
+  if (!parseResult.ast) {
     return {
       success: false,
       diagnostics: allDiagnostics,
       formattedDiagnostics: renderDiagnostics(allDiagnostics, sourceMap),
       tokens: lexResult.tokens,
-      ast: parseResult.ast || null,
+      ast: null,
       lir: null,
       wasmBytes: null,
       debugInfo: null,
     };
   }
 
-  // 3. Type Checker
+  // 3. Type Checker (runs on recovered AST so syntax + type errors are both reported in one pass)
   const tcResult = typecheck(parseResult.ast, { filename, sourceMap });
   allDiagnostics.push(...tcResult.diagnostics);
 
