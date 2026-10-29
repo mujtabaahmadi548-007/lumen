@@ -22,16 +22,23 @@ export const ErrorCodes = Object.freeze({
   PARSE_EXPECTED_TOKEN: "E0102",
   PARSE_EXPECTED_EXPR: "E0103",
   PARSE_EXPECTED_TYPE: "E0104",
+  PARSE_EXPECTED_PATTERN: "E0105",
   PARSE_INVALID_ASSIGN_TARGET: "E0106",
   PARSE_EXPECTED_DECL: "E0107",
 
-  // Type Checker (M1-M2 Scope: E0201 - E0206, E0213, E0214, E0217 - E0223)
+  // Type Checker (M1-M3 Scope)
   TYPE_MISMATCH: "E0201",
   TYPE_UNDEFINED_VAR: "E0202",
   TYPE_UNDEFINED_TYPE: "E0203",
   TYPE_UNDEFINED_FN: "E0204",
   TYPE_ARITY_MISMATCH: "E0205",
   TYPE_IMMUTABLE_ASSIGN: "E0206",
+  TYPE_UNKNOWN_FIELD: "E0207",
+  TYPE_MISSING_FIELD: "E0208",
+  TYPE_DUPLICATE_FIELD: "E0209",
+  TYPE_UNKNOWN_VARIANT: "E0210",
+  TYPE_NOT_INDEXABLE: "E0211",
+  TYPE_INDEX_NOT_INT: "E0212",
   TYPE_NOT_CALLABLE: "E0213",
   TYPE_INVALID_CAST: "E0214",
   TYPE_RETURN_MISMATCH: "E0217",
@@ -41,6 +48,11 @@ export const ErrorCodes = Object.freeze({
   TYPE_CONDITION_NOT_BOOL: "E0221",
   TYPE_BINARY_OP_MISMATCH: "E0222",
   TYPE_UNARY_OP_MISMATCH: "E0223",
+
+  // Pattern Matching & Exhaustiveness (E0301 - E0303)
+  MATCH_NON_EXHAUSTIVE: "E0301",
+  MATCH_REDUNDANT_ARM: "E0302",
+  MATCH_PATTERN_ARITY: "E0303",
 });
 
 export function createSpan(
@@ -488,6 +500,10 @@ export const BUILTIN_NAMES = new Set([
   "str_eq",
   "str_hash",
   "str_to_int",
+  "array_len",
+  "array_push",
+  "array_pop",
+  "array_new",
   "sqrt",
   "sin",
   "cos",
@@ -499,6 +515,8 @@ export const BUILTIN_NAMES = new Set([
   "clock_ms",
   "assert",
   "panic",
+  "grow_array",
+  "trap",
 ]);
 
 // ============================================================================

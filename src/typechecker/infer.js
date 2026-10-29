@@ -35,8 +35,10 @@ import {
   unify,
   resetTypeVarCounter,
   findClosestMatch,
+  substituteTypeParams,
 } from "./types.js";
 import { TypeEnv } from "./env.js";
+import { checkMatchExhaustiveness } from "./exhaustiveness.js";
 
 const DEFAULT_SUGGESTIONS = Object.freeze({
   [ErrorCodes.TYPE_MISMATCH]:
@@ -44,13 +46,25 @@ const DEFAULT_SUGGESTIONS = Object.freeze({
   [ErrorCodes.TYPE_UNDEFINED_VAR]:
     "Declare the variable with `let` before referencing it",
   [ErrorCodes.TYPE_UNDEFINED_TYPE]:
-    "Use a built-in primitive type (`i32`, `i64`, `f64`, `bool`, `string`, or `void`)",
+    "Use a built-in primitive type (`i32`, `i64`, `f64`, `bool`, `string`, or `void`) or declare the struct/enum",
   [ErrorCodes.TYPE_UNDEFINED_FN]:
     "Define the function with `fn` before calling it, or check the function name spelling",
   [ErrorCodes.TYPE_ARITY_MISMATCH]:
     "Check the function signature and pass the expected number of arguments",
   [ErrorCodes.TYPE_IMMUTABLE_ASSIGN]:
     "Declare the variable with `let mut` so it can be reassigned",
+  [ErrorCodes.TYPE_UNKNOWN_FIELD]:
+    "Check the struct definition for available field names",
+  [ErrorCodes.TYPE_MISSING_FIELD]:
+    "Provide all required fields in the struct instantiation",
+  [ErrorCodes.TYPE_DUPLICATE_FIELD]:
+    "Remove the duplicate field name",
+  [ErrorCodes.TYPE_UNKNOWN_VARIANT]:
+    "Check the enum definition for available variant names",
+  [ErrorCodes.TYPE_NOT_INDEXABLE]:
+    "Only array types `[T]` can be indexed with `[...]`",
+  [ErrorCodes.TYPE_INDEX_NOT_INT]:
+    "Use an integer index (`i32` or `i64`) to index an array",
   [ErrorCodes.TYPE_NOT_CALLABLE]:
     "Only functions can be called with `(...)`",
   [ErrorCodes.TYPE_INVALID_CAST]:
@@ -69,6 +83,12 @@ const DEFAULT_SUGGESTIONS = Object.freeze({
     "Ensure both operands have compatible types for this binary operator",
   [ErrorCodes.TYPE_UNARY_OP_MISMATCH]:
     "Ensure the operand has a valid type for this unary operator",
+  [ErrorCodes.MATCH_NON_EXHAUSTIVE]:
+    "Cover all enum variants or add a wildcard `_ => ...` fallback arm",
+  [ErrorCodes.MATCH_REDUNDANT_ARM]:
+    "Remove this unreachable arm or move more specific patterns earlier",
+  [ErrorCodes.MATCH_PATTERN_ARITY]:
+    "Check the variant definition and match the expected number of arguments",
 });
 
 const M2_PRIMITIVE_TYPE_NAMES = [
@@ -157,14 +177,33 @@ export class TypeChecker {
                 break;
               }
             }
-            const closest = findClosestMatch(name, M2_PRIMITIVE_TYPE_NAMES);
+            if (this.env.hasStruct(name)) {
+              const typeArgs = (typeNode.typeArgs || []).map((arg) =>
+                this.resolveTypeNode(arg, scope)
+              );
+              resolved = this.env.instantiateStruct(name, typeArgs.length ? typeArgs : null);
+              break;
+            }
+            if (this.env.hasEnum(name)) {
+              const typeArgs = (typeNode.typeArgs || []).map((arg) =>
+                this.resolveTypeNode(arg, scope)
+              );
+              resolved = this.env.instantiateEnum(name, typeArgs.length ? typeArgs : null);
+              break;
+            }
+            const candidateNames = [
+              ...M2_PRIMITIVE_TYPE_NAMES,
+              ...Array.from(this.env.structs.keys()),
+              ...Array.from(this.env.enums.keys()),
+            ];
+            const closest = findClosestMatch(name, candidateNames);
             this.reportError(
               ErrorCodes.TYPE_UNDEFINED_TYPE,
               `unknown type \`${name}\``,
               typeNode.span,
               closest
                 ? `Did you mean \`${closest}\`?`
-                : "Use a built-in primitive type (`i32`, `i64`, `f64`, `bool`, `string`, or `void`)"
+                : "Use a built-in primitive type or declared struct/enum"
             );
             resolved = Types.ERROR;
             break;
@@ -205,6 +244,111 @@ export class TypeChecker {
 
     const declaredFns = new Set();
     const declaredConsts = new Set();
+    const declaredTypes = new Set();
+
+    // Pass 0a: Register all StructDecl & EnumDecl names
+    for (const decl of ast.decls) {
+      if (!decl) continue;
+      if (decl.kind === "StructDecl" || decl.kind === "EnumDecl") {
+        if (decl.name === "_error") continue;
+        if (declaredTypes.has(decl.name) || this.env.hasStruct(decl.name) || this.env.hasEnum(decl.name)) {
+          this.reportError(
+            ErrorCodes.TYPE_DUPLICATE_SYMBOL,
+            `duplicate type definition \`${decl.name}\``,
+            decl.span,
+            `Rename or remove the duplicate type \`${decl.name}\``
+          );
+          decl._isDuplicate = true;
+          continue;
+        }
+        declaredTypes.add(decl.name);
+        if (decl.kind === "StructDecl") {
+          this.env.registerStruct({
+            name: decl.name,
+            typeParams: decl.typeParams || [],
+            fields: [],
+            isPublic: Boolean(decl.isPublic),
+            decl,
+            span: decl.span,
+          });
+        } else {
+          this.env.registerEnum({
+            name: decl.name,
+            typeParams: decl.typeParams || [],
+            variants: [],
+            isPublic: Boolean(decl.isPublic),
+            decl,
+            span: decl.span,
+          });
+        }
+      }
+    }
+
+    // Pass 0b: Populate fields of StructDecls and variants of EnumDecls
+    for (const decl of ast.decls) {
+      if (!decl || decl._isDuplicate) continue;
+      if (decl.kind === "StructDecl") {
+        const fieldNames = new Set();
+        const resolvedFields = [];
+        for (const f of decl.fields || []) {
+          if (fieldNames.has(f.name)) {
+            this.reportError(
+              ErrorCodes.TYPE_DUPLICATE_FIELD,
+              `duplicate field \`${f.name}\` in struct \`${decl.name}\``,
+              f.span,
+              `Remove or rename duplicate field \`${f.name}\``
+            );
+          }
+          fieldNames.add(f.name);
+          const fType = this.resolveTypeNode(f.typeAnn, this.env.globalScope);
+          resolvedFields.push({
+            name: f.name,
+            type: fType,
+            span: f.span,
+          });
+        }
+        this.env.registerStruct({
+          name: decl.name,
+          typeParams: decl.typeParams || [],
+          fields: resolvedFields,
+          isPublic: Boolean(decl.isPublic),
+          decl,
+          span: decl.span,
+        });
+      } else if (decl.kind === "EnumDecl") {
+        const variantNames = new Set();
+        const resolvedVariants = [];
+        for (let idx = 0; idx < (decl.variants || []).length; idx++) {
+          const v = decl.variants[idx];
+          if (variantNames.has(v.name)) {
+            this.reportError(
+              ErrorCodes.TYPE_DUPLICATE_SYMBOL,
+              `duplicate variant \`${v.name}\` in enum \`${decl.name}\``,
+              v.span,
+              `Rename or remove duplicate variant \`${v.name}\``
+            );
+          }
+          variantNames.add(v.name);
+          const pTypes = (v.payload || []).map((pt) =>
+            this.resolveTypeNode(pt, this.env.globalScope)
+          );
+          resolvedVariants.push({
+            name: v.name,
+            fields: pTypes,
+            tagIndex: idx,
+            span: v.span,
+          });
+        }
+        this.env.registerEnum({
+          name: decl.name,
+          typeParams: decl.typeParams || [],
+          variants: resolvedVariants,
+          isPublic: Boolean(decl.isPublic),
+          decl,
+          span: decl.span,
+        });
+      }
+    }
 
     // Pass 1: Register all top-level function signatures (supports recursion & mutual recursion)
     for (const decl of ast.decls) {
@@ -439,6 +583,9 @@ export class TypeChecker {
         );
       case "ExprStmt":
         return this.exprAlwaysReturns(stmt.expr);
+      case "MatchStmt":
+      case "MatchExpr":
+        return this.exprAlwaysReturns(stmt);
       default:
         return false;
     }
@@ -463,6 +610,13 @@ export class TypeChecker {
     }
     if (expr.kind === "BlockExpr") {
       return this.blockAlwaysReturns(expr.block);
+    }
+    if (expr.kind === "MatchExpr" || expr.kind === "MatchStmt") {
+      return Boolean(
+        expr.arms &&
+          expr.arms.length > 0 &&
+          expr.arms.every((arm) => this.exprAlwaysReturns(arm.body))
+      );
     }
     return false;
   }
@@ -895,7 +1049,12 @@ export class TypeChecker {
       }
 
       case "BlockExpr": {
-        resultType = this.checkBlockStmt(expr.block, scope, expectedType, true);
+        resultType = this.checkBlockStmt(expr.block || expr, scope, expectedType, true);
+        break;
+      }
+
+      case "BlockStmt": {
+        resultType = this.checkBlockStmt(expr, scope, expectedType, true);
         break;
       }
 
@@ -981,6 +1140,328 @@ export class TypeChecker {
         break;
       }
 
+      case "StructLitExpr": {
+        const structName = expr.structName;
+        const structDef = this.env.getStruct(structName);
+        if (!structDef) {
+          this.reportError(
+            ErrorCodes.TYPE_UNDEFINED_TYPE,
+            `unknown struct \`${structName}\``,
+            expr.span,
+            "Declare the struct with `struct` before instantiating it"
+          );
+          resultType = Types.ERROR;
+          break;
+        }
+
+        const typeArgs = expr.typeArgs?.length
+          ? expr.typeArgs.map((t) => this.resolveTypeNode(t, scope))
+          : null;
+        const instantiated = this.env.instantiateStruct(structName, typeArgs);
+        const defFields = new Map(
+          structDef.fields.map((f, i) => [
+            f.name,
+            { index: i, type: instantiated.fields ? instantiated.fields[i].type : f.type },
+          ])
+        );
+
+        const seenFields = new Set();
+        for (const f of expr.fields || []) {
+          if (seenFields.has(f.name)) {
+            this.reportError(
+              ErrorCodes.TYPE_DUPLICATE_FIELD,
+              `duplicate field \`${f.name}\` in struct literal \`${structName}\``,
+              f.span || expr.span,
+              `Remove the duplicate initialization of field \`${f.name}\``
+            );
+          }
+          seenFields.add(f.name);
+
+          if (!defFields.has(f.name)) {
+            this.reportError(
+              ErrorCodes.TYPE_UNKNOWN_FIELD,
+              `unknown field \`${f.name}\` for struct \`${structName}\``,
+              f.span || expr.span,
+              `Available fields on \`${structName}\` are: ${Array.from(defFields.keys()).map((k) => `\`${k}\``).join(", ")}`
+            );
+            this.inferExpr(f.value, scope, null);
+          } else {
+            const expectedFieldType = defFields.get(f.name).type;
+            const actualFieldType = this.inferExpr(f.value, scope, expectedFieldType);
+            if (!unify(expectedFieldType, actualFieldType) && !isErrorType(actualFieldType)) {
+              this.reportError(
+                ErrorCodes.TYPE_MISMATCH,
+                `field \`${f.name}\` of struct \`${structName}\` has type \`${typeToString(expectedFieldType)}\`, found \`${typeToString(actualFieldType)}\``,
+                f.value?.span || f.span || expr.span,
+                `Provide a value of type \`${typeToString(expectedFieldType)}\` for field \`${f.name}\``
+              );
+            }
+          }
+        }
+
+        // Check missing fields
+        for (const [fname, finfo] of defFields.entries()) {
+          if (!seenFields.has(fname)) {
+            this.reportError(
+              ErrorCodes.TYPE_MISSING_FIELD,
+              `missing field \`${fname}\` in struct literal \`${structName}\``,
+              expr.span,
+              `Add \`${fname}: ...\` to initialize the struct`
+            );
+          }
+        }
+
+        expr.structDef = structDef;
+        resultType = instantiated;
+        break;
+      }
+
+      case "FieldExpr": {
+        const objType = unwrapType(this.inferExpr(expr.object, scope, null));
+        if (isErrorType(objType)) {
+          resultType = Types.ERROR;
+          break;
+        }
+        if (objType.tag !== "struct") {
+          this.reportError(
+            ErrorCodes.TYPE_UNKNOWN_FIELD,
+            `cannot access field \`${expr.field}\` on non-struct type \`${typeToString(objType)}\``,
+            expr.span,
+            "Field access `obj.field` requires a struct expression"
+          );
+          resultType = Types.ERROR;
+          break;
+        }
+
+        const structDef = this.env.getStruct(objType.name);
+        if (!structDef) {
+          resultType = Types.ERROR;
+          break;
+        }
+
+        const fieldIdx = structDef.fields.findIndex((f) => f.name === expr.field);
+        if (fieldIdx === -1) {
+          this.reportError(
+            ErrorCodes.TYPE_UNKNOWN_FIELD,
+            `unknown field \`${expr.field}\` on struct \`${objType.name}\``,
+            expr.span,
+            `Available fields on \`${objType.name}\` are: ${structDef.fields.map((f) => `\`${f.name}\``).join(", ")}`
+          );
+          resultType = Types.ERROR;
+          break;
+        }
+
+        expr.fieldIndex = fieldIdx;
+        const fType = objType.fields ? objType.fields[fieldIdx].type : structDef.fields[fieldIdx].type;
+        resultType = unwrapType(fType);
+        break;
+      }
+
+      case "ArrayLitExpr": {
+        const elements = expr.elements || [];
+        let elemType = null;
+        if (expectedType && unwrapType(expectedType).tag === "array") {
+          elemType = unwrapType(expectedType).elem;
+        }
+
+        if (elements.length === 0) {
+          resultType = Types.array(elemType || Types.typevar());
+          break;
+        }
+
+        let inferredElemType = elemType;
+        for (let i = 0; i < elements.length; i++) {
+          const e = elements[i];
+          const eType = this.inferExpr(e, scope, inferredElemType);
+          if (!inferredElemType) {
+            inferredElemType = eType;
+          } else if (!unify(inferredElemType, eType) && !isErrorType(eType)) {
+            this.reportError(
+              ErrorCodes.TYPE_MISMATCH,
+              `element ${i} of array has type \`${typeToString(eType)}\`, expected \`${typeToString(inferredElemType)}\``,
+              e.span || expr.span,
+              `Ensure all array elements have type \`${typeToString(inferredElemType)}\``
+            );
+          }
+        }
+
+        resultType = Types.array(inferredElemType || Types.I32);
+        break;
+      }
+
+      case "IndexExpr": {
+        const objType = unwrapType(this.inferExpr(expr.object, scope, null));
+        const idxType = unwrapType(this.inferExpr(expr.index, scope, Types.I32));
+
+        if (!isErrorType(objType)) {
+          if (objType.tag !== "array") {
+            this.reportError(
+              ErrorCodes.TYPE_NOT_INDEXABLE,
+              `cannot index value of type \`${typeToString(objType)}\``,
+              expr.object?.span || expr.span,
+              "Only array types `[T]` can be indexed with `[...]`"
+            );
+          }
+        }
+
+        if (!isErrorType(idxType)) {
+          if (!isIntegerType(idxType)) {
+            this.reportError(
+              ErrorCodes.TYPE_INDEX_NOT_INT,
+              `array index must be an integer (\`i32\` or \`i64\`), found \`${typeToString(idxType)}\``,
+              expr.index?.span || expr.span,
+              "Use an `i32` or `i64` integer value for the array index"
+            );
+          }
+        }
+
+        if (objType.tag === "array") {
+          resultType = unwrapType(objType.elem);
+        } else {
+          resultType = Types.ERROR;
+        }
+        break;
+      }
+
+      case "EnumInitExpr": {
+        const variantName = expr.variantName;
+        let enumDef = null;
+        if (expr.enumName) {
+          enumDef = this.env.getEnum(expr.enumName);
+        } else {
+          const vInfo = this.env.lookupVariant(variantName);
+          if (vInfo) enumDef = this.env.getEnum(vInfo.enumName);
+        }
+
+        if (!enumDef) {
+          this.reportError(
+            ErrorCodes.TYPE_UNKNOWN_VARIANT,
+            `unknown enum variant \`${variantName}\``,
+            expr.span,
+            "Check the variant name or declare the enum"
+          );
+          resultType = Types.ERROR;
+          break;
+        }
+
+        const variant = enumDef.variants.find((v) => v.name === variantName);
+        if (!variant) {
+          this.reportError(
+            ErrorCodes.TYPE_UNKNOWN_VARIANT,
+            `variant \`${variantName}\` does not exist on enum \`${enumDef.name}\``,
+            expr.span,
+            `Available variants of \`${enumDef.name}\` are: ${enumDef.variants.map((v) => `\`${v.name}\``).join(", ")}`
+          );
+          resultType = Types.ERROR;
+          break;
+        }
+
+        const expectedArity = variant.fields.length;
+        const actualArity = (expr.args || []).length;
+        if (actualArity !== expectedArity) {
+          this.reportError(
+            ErrorCodes.TYPE_ARITY_MISMATCH,
+            `variant \`${variantName}\` expects ${expectedArity} arguments, found ${actualArity}`,
+            expr.span,
+            `Pass ${expectedArity} arguments to \`${variantName}(...)\``
+          );
+        }
+
+        let typeArgs = null;
+        if (
+          expectedType &&
+          unwrapType(expectedType).tag === "enum" &&
+          unwrapType(expectedType).name === enumDef.name
+        ) {
+          typeArgs = unwrapType(expectedType).typeArgs;
+        }
+        const instEnum = this.env.instantiateEnum(enumDef.name, typeArgs);
+        const instVariant =
+          instEnum && instEnum.variants
+            ? instEnum.variants.find((v) => v.name === variantName)
+            : variant;
+
+        for (let i = 0; i < actualArity; i++) {
+          const expectedFieldType =
+            instVariant && instVariant.fields && instVariant.fields[i]
+              ? instVariant.fields[i]
+              : null;
+          const actualArgType = this.inferExpr(expr.args[i], scope, expectedFieldType);
+          if (
+            expectedFieldType &&
+            !unify(expectedFieldType, actualArgType) &&
+            !isErrorType(actualArgType)
+          ) {
+            this.reportError(
+              ErrorCodes.TYPE_MISMATCH,
+              `argument ${i + 1} of variant \`${variantName}\` has type \`${typeToString(actualArgType)}\`, expected \`${typeToString(expectedFieldType)}\``,
+              expr.args[i]?.span || expr.span,
+              `Provide an argument of type \`${typeToString(expectedFieldType)}\``
+            );
+          }
+        }
+
+        expr.tagIndex = variant.tagIndex;
+        expr.enumDef = enumDef;
+        resultType = instEnum;
+        break;
+      }
+
+      case "MatchExpr": {
+        const scrutineeNode = expr.scrutinee || expr.expr;
+        const scrutineeType = unwrapType(this.inferExpr(scrutineeNode, scope, null));
+        const arms = expr.arms || [];
+
+        // Exhaustiveness & Redundancy checks
+        if (!isErrorType(scrutineeType)) {
+          const exhDiagnostics = checkMatchExhaustiveness(
+            scrutineeType,
+            arms,
+            this.env,
+            expr.span,
+            this.sourceMap
+          );
+          for (const d of exhDiagnostics) {
+            d.sourceLine = this.getSourceLine(d.span);
+            this.diagnostics.push(d);
+          }
+        }
+
+        let armResultType = expectedType;
+        for (let i = 0; i < arms.length; i++) {
+          const arm = arms[i];
+          const armScope = scope.child();
+          this.checkPattern(arm.pattern, scrutineeType, armScope);
+
+          if (arm.guard) {
+            const guardType = this.inferExpr(arm.guard, armScope, Types.BOOL);
+            if (!isBoolType(guardType) && !isErrorType(guardType)) {
+              this.reportError(
+                ErrorCodes.TYPE_CONDITION_NOT_BOOL,
+                `match guard condition must be \`bool\`, found \`${typeToString(guardType)}\``,
+                arm.guard.span,
+                "Use a boolean expression for the match guard"
+              );
+            }
+          }
+
+          const bodyType = this.inferExpr(arm.body, armScope, armResultType);
+          if (!armResultType) {
+            armResultType = bodyType;
+          } else if (!unify(armResultType, bodyType) && !isErrorType(bodyType)) {
+            this.reportError(
+              ErrorCodes.TYPE_MISMATCH,
+              `match arm ${i + 1} has type \`${typeToString(bodyType)}\`, expected \`${typeToString(armResultType)}\``,
+              arm.body?.span || arm.span,
+              `Ensure all match arms return values of type \`${typeToString(armResultType)}\``
+            );
+          }
+        }
+
+        resultType = armResultType || Types.VOID;
+        break;
+      }
+
       default: {
         resultType = Types.VOID;
         break;
@@ -989,6 +1470,167 @@ export class TypeChecker {
 
     expr.inferredType = unwrapType(resultType);
     return expr.inferredType;
+  }
+
+  checkPattern(pattern, expectedType, scope) {
+    if (!pattern) return;
+    const baseType = unwrapType(expectedType);
+    pattern.inferredType = baseType;
+
+    switch (pattern.kind) {
+      case "WildcardPattern":
+        break;
+
+      case "VarPattern": {
+        scope.define(pattern.name, baseType, {
+          mutable: Boolean(pattern.mutable),
+          span: pattern.span,
+        });
+        break;
+      }
+
+      case "LiteralPattern": {
+        const litNode = pattern.literal || pattern;
+        let litType = Types.I32;
+        switch (litNode.literalType) {
+          case "i32":
+            litType = Types.I32;
+            break;
+          case "i64":
+            litType = Types.I64;
+            break;
+          case "f64":
+            litType = Types.F64;
+            break;
+          case "bool":
+            litType = Types.BOOL;
+            break;
+          case "string":
+            litType = Types.STRING;
+            break;
+        }
+        pattern.inferredType = litType;
+        if (pattern.literal) pattern.literal.inferredType = litType;
+        if (!unify(baseType, litType) && !isErrorType(baseType)) {
+          this.reportError(
+            ErrorCodes.TYPE_MISMATCH,
+            `pattern of type \`${typeToString(litType)}\` cannot match expression of type \`${typeToString(baseType)}\``,
+            pattern.span,
+            `Use a literal pattern of type \`${typeToString(baseType)}\``
+          );
+        }
+        break;
+      }
+
+      case "EnumPattern": {
+        let enumDef = null;
+        const variantName = pattern.variantName;
+        if (pattern.enumName) {
+          enumDef = this.env.getEnum(pattern.enumName);
+        } else if (baseType.tag === "enum") {
+          enumDef = this.env.getEnum(baseType.name);
+        } else {
+          const vInfo = this.env.lookupVariant(variantName);
+          if (vInfo) enumDef = this.env.getEnum(vInfo.enumName);
+        }
+
+        if (!enumDef) {
+          this.reportError(
+            ErrorCodes.TYPE_UNKNOWN_VARIANT,
+            `unknown enum or variant \`${variantName}\``,
+            pattern.span,
+            "Check the variant name or enum definition"
+          );
+          return;
+        }
+
+        const variant = enumDef.variants.find((v) => v.name === variantName);
+        if (!variant) {
+          this.reportError(
+            ErrorCodes.TYPE_UNKNOWN_VARIANT,
+            `variant \`${variantName}\` does not exist on enum \`${enumDef.name}\``,
+            pattern.span,
+            `Check available variants of \`${enumDef.name}\``
+          );
+          return;
+        }
+
+        const expectedArity = variant.fields.length;
+        const actualArity = (pattern.args || []).length;
+        if (actualArity !== expectedArity) {
+          this.reportError(
+            ErrorCodes.MATCH_PATTERN_ARITY,
+            `variant \`${variantName}\` expects ${expectedArity} pattern arguments, found ${actualArity}`,
+            pattern.span,
+            `Match \`${variantName}\` with ${expectedArity} arguments: \`${variantName}(...)\``
+          );
+        }
+
+        const instantiatedEnum = this.env.instantiateEnum(
+          enumDef.name,
+          baseType.typeArgs || null
+        );
+        if (!unify(baseType, instantiatedEnum) && !isErrorType(baseType)) {
+          this.reportError(
+            ErrorCodes.TYPE_MISMATCH,
+            `pattern \`${variantName}\` belongs to enum \`${enumDef.name}\`, but match expression has type \`${typeToString(baseType)}\``,
+            pattern.span,
+            `Ensure the pattern matches the scrutinee type \`${typeToString(baseType)}\``
+          );
+        }
+
+        const instVariant =
+          instantiatedEnum?.variants?.find((v) => v.name === variantName) || variant;
+        for (let i = 0; i < Math.min(actualArity, expectedArity); i++) {
+          const fieldType = instVariant.fields[i];
+          this.checkPattern(pattern.args[i], fieldType, scope);
+        }
+        break;
+      }
+
+      case "StructPattern": {
+        const structName = pattern.structName;
+        const structDef = this.env.getStruct(structName);
+        if (!structDef) {
+          this.reportError(
+            ErrorCodes.TYPE_UNDEFINED_TYPE,
+            `unknown struct \`${structName}\` in pattern`,
+            pattern.span,
+            "Check the struct name spelling or define the struct"
+          );
+          return;
+        }
+
+        const instantiatedStruct = this.env.instantiateStruct(
+          structName,
+          baseType.typeArgs || null
+        );
+        if (!unify(baseType, instantiatedStruct) && !isErrorType(baseType)) {
+          this.reportError(
+            ErrorCodes.TYPE_MISMATCH,
+            `struct pattern \`${structName}\` cannot match expression of type \`${typeToString(baseType)}\``,
+            pattern.span,
+            `Ensure the pattern matches the scrutinee type \`${typeToString(baseType)}\``
+          );
+        }
+
+        const structFields = new Map(structDef.fields.map((f) => [f.name, f.type]));
+        for (const f of pattern.fields || []) {
+          if (!structFields.has(f.name)) {
+            this.reportError(
+              ErrorCodes.TYPE_UNKNOWN_FIELD,
+              `unknown field \`${f.name}\` in struct pattern \`${structName}\``,
+              f.span,
+              `Available fields on \`${structName}\` are: ${Array.from(structFields.keys()).map((k) => `\`${k}\``).join(", ")}`
+            );
+          } else {
+            const fieldType = structFields.get(f.name);
+            this.checkPattern(f.pattern, fieldType, scope);
+          }
+        }
+        break;
+      }
+    }
   }
 
   inferCallExpr(expr, scope, expectedType = null) {
@@ -1114,10 +1756,27 @@ export class TypeChecker {
         }
 
         // Standard function call
+        let paramTypes = fnDef.paramTypes;
+        let returnType = fnDef.returnType;
+        if (fnDef.typeParams && fnDef.typeParams.length > 0) {
+          const subst = new Map();
+          for (const tp of fnDef.typeParams) {
+            subst.set(tp, Types.typevar(tp));
+          }
+          paramTypes = fnDef.paramTypes.map((pt) =>
+            substituteTypeParams(pt, subst)
+          );
+          returnType = substituteTypeParams(fnDef.returnType, subst);
+        }
+
         for (let i = 0; i < args.length; i++) {
-          const paramType = fnDef.paramTypes[i];
+          const paramType = paramTypes[i];
           const argType = this.inferExpr(args[i], scope, paramType);
-          if (!isErrorType(paramType) && !isErrorType(argType) && !unify(paramType, argType)) {
+          if (
+            !isErrorType(paramType) &&
+            !isErrorType(argType) &&
+            !unify(paramType, argType)
+          ) {
             this.reportError(
               ErrorCodes.TYPE_MISMATCH,
               `argument ${i + 1} to \`${fnName}\` has incompatible type: expected \`${typeToString(paramType)}\`, found \`${typeToString(argType)}\``,
@@ -1127,7 +1786,7 @@ export class TypeChecker {
           }
         }
 
-        return unwrapType(fnDef.returnType);
+        return unwrapType(returnType);
       }
     }
 

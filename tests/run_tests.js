@@ -2,7 +2,7 @@
  * Lumen Test Suite Runner (`tests/run_tests.js`)
  * Owned exclusively by Agent G.
  *
- * Runs all positive, runtime-trap, and negative error tests comparing
+ * Runs all positive, runtime-trap, negative error, and LIR safety tests comparing
  * WebAssembly compiled execution against the Reference Interpreter.
  */
 
@@ -11,7 +11,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { ErrorCodes } from "../src/contracts/index.js";
+import { ErrorCodes, validateLir } from "../src/contracts/index.js";
 import {
   compileSource,
   runSourceWasm,
@@ -20,6 +20,8 @@ import {
 } from "../src/compiler.js";
 import { M2_POSITIVE_TESTS } from "./m2_positive_tests.js";
 import { M2_NEGATIVE_TESTS } from "./m2_negative_tests.js";
+import { M3_POSITIVE_TESTS } from "./m3_positive_tests.js";
+import { M3_NEGATIVE_TESTS } from "./m3_negative_tests.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -33,7 +35,7 @@ export async function runAllTests(options = {}) {
   const failures = [];
 
   console.log("\n========================================================");
-  console.log("             LUMEN TEST SUITE RUNNER (M2)");
+  console.log("             LUMEN TEST SUITE RUNNER (M3)");
   console.log("========================================================\n");
 
   // ========================================================================
@@ -41,10 +43,11 @@ export async function runAllTests(options = {}) {
   // ========================================================================
   console.log("--- Running Positive & Runtime Trap Tests (Wasm vs Interpreter Parity) ---");
 
+  const allPositiveTests = [...M2_POSITIVE_TESTS, ...M3_POSITIVE_TESTS];
   let posPassed = 0;
   let posFailed = 0;
 
-  for (const test of M2_POSITIVE_TESTS) {
+  for (const test of allPositiveTests) {
     if (filter && !test.name.toLowerCase().includes(filter) && !(test.category && test.category.toLowerCase().includes(filter))) {
       continue;
     }
@@ -169,11 +172,12 @@ export async function runAllTests(options = {}) {
   // ========================================================================
   console.log("\n--- Running Negative Error Tests (Diagnostics & Fix Suggestions) ---");
 
+  const allNegativeTests = [...M2_NEGATIVE_TESTS, ...M3_NEGATIVE_TESTS];
   let negPassed = 0;
   let negFailed = 0;
   const testedCodes = new Set();
 
-  for (const test of M2_NEGATIVE_TESTS) {
+  for (const test of allNegativeTests) {
     if (filter && !test.name.toLowerCase().includes(filter)) {
       continue;
     }
@@ -238,12 +242,190 @@ export async function runAllTests(options = {}) {
   const allContractCodes = Object.values(ErrorCodes);
   const uncoveredCodes = allContractCodes.filter((c) => !testedCodes.has(c));
   if (uncoveredCodes.length > 0 && !filter) {
-    console.log(`\n  WARNING: The following ErrorCodes were not tested in M2_NEGATIVE_TESTS: ${uncoveredCodes.join(", ")}`);
+    console.log(`\n  WARNING: The following ErrorCodes were not tested: ${uncoveredCodes.join(", ")}`);
     failed++;
     failures.push({ name: "uncovered_error_codes", errors: [`Uncovered ErrorCodes: ${uncoveredCodes.join(", ")}`] });
   } else if (!filter) {
     console.log(`\n  PASS: 100% of ErrorCodes covered (${testedCodes.size}/${allContractCodes.length})`);
     passed++;
+  }
+
+  // ========================================================================
+  // 4. LIR Invariant & GC Safety Verification (validateLir Rejection Tests)
+  // ========================================================================
+  console.log("\n--- Running LIR GC Stack Safety & Invariant Tests (validateLir) ---");
+
+  let lirPassed = 0;
+  let lirFailed = 0;
+
+  // Test 4.1: Reject unrooted gc_ref on stack across an allocating or calling operand
+  try {
+    const badStackLir = {
+      functions: [
+        {
+          name: "test_violating_stack",
+          params: [],
+          locals: [],
+          body: [
+            {
+              op: "expr",
+              expr: {
+                op: "call",
+                funcName: "target_fn",
+                type: "i32",
+                args: [
+                  { op: "gc_alloc", type: "gc_ref", payloadSize: { op: "const_i32", value: 16, type: "i32" } },
+                  { op: "call", funcName: "allocating_call", type: "i32", args: [] },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+      typeDescriptors: [],
+    };
+    let threw = false;
+    try {
+      validateLir(badStackLir);
+    } catch (e) {
+      if (e.message.includes("LIR GC Stack Safety Violation")) {
+        threw = true;
+      }
+    }
+    if (threw) {
+      console.log("  PASS: validateLir rejects unrooted gc_ref on stack across call");
+      lirPassed++;
+      passed++;
+    } else {
+      console.log("  FAIL: validateLir did not reject unrooted gc_ref across call");
+      lirFailed++;
+      failed++;
+    }
+  } catch (err) {
+    lirFailed++;
+    failed++;
+  }
+
+  // Test 4.2: Reject mem_load with offset < 8
+  try {
+    const badLoadOffsetLir = {
+      functions: [
+        {
+          name: "test_bad_offset",
+          params: [],
+          locals: [],
+          body: [
+            {
+              op: "expr",
+              expr: {
+                op: "mem_load",
+                type: "i32",
+                ptr: { op: "const_i32", value: 100, type: "i32" },
+                offset: 4,
+              },
+            },
+          ],
+        },
+      ],
+      typeDescriptors: [],
+    };
+    let threw = false;
+    try {
+      validateLir(badLoadOffsetLir);
+    } catch (e) {
+      if (e.message.includes("must be >= 8")) {
+        threw = true;
+      }
+    }
+    if (threw) {
+      console.log("  PASS: validateLir rejects mem_load with offset < 8");
+      lirPassed++;
+      passed++;
+    } else {
+      console.log("  FAIL: validateLir did not reject mem_load with offset < 8");
+      lirFailed++;
+      failed++;
+    }
+  } catch (err) {
+    lirFailed++;
+    failed++;
+  }
+
+  // Test 4.3: Reject mem_store with offset < 8
+  try {
+    const badStoreOffsetLir = {
+      functions: [
+        {
+          name: "test_bad_store_offset",
+          params: [],
+          locals: [],
+          body: [
+            {
+              op: "mem_store",
+              type: "i32",
+              offset: 0,
+              ptr: { op: "const_i32", value: 100, type: "i32" },
+              value: { op: "const_i32", value: 42, type: "i32" },
+            },
+          ],
+        },
+      ],
+      typeDescriptors: [],
+    };
+    let threw = false;
+    try {
+      validateLir(badStoreOffsetLir);
+    } catch (e) {
+      if (e.message.includes("must be >= 8")) {
+        threw = true;
+      }
+    }
+    if (threw) {
+      console.log("  PASS: validateLir rejects mem_store with offset < 8");
+      lirPassed++;
+      passed++;
+    } else {
+      console.log("  FAIL: validateLir did not reject mem_store with offset < 8");
+      lirFailed++;
+      failed++;
+    }
+  } catch (err) {
+    lirFailed++;
+    failed++;
+  }
+
+  // Test 4.4: Reject TypeDescriptor pointerOffset < 8
+  try {
+    const badTdOffsetLir = {
+      functions: [],
+      typeDescriptors: [
+        {
+          name: "BadTypeDesc",
+          totalSize: 16,
+          pointerOffsets: [0],
+        },
+      ],
+    };
+    let threw = false;
+    try {
+      validateLir(badTdOffsetLir);
+    } catch (e) {
+      if (e.message.includes("must be >= 8")) {
+        threw = true;
+      }
+    }
+    if (threw) {
+      console.log("  PASS: validateLir rejects TypeDescriptor pointerOffset < 8");
+      lirPassed++;
+      passed++;
+    } else {
+      console.log("  FAIL: validateLir did not reject TypeDescriptor pointerOffset < 8");
+      lirFailed++;
+      failed++;
+    }
+  } catch (err) {
+    lirFailed++;
+    failed++;
   }
 
   // ========================================================================
@@ -255,6 +437,7 @@ export async function runAllTests(options = {}) {
   console.log(`  Positive & Trap Tests : ${posPassed}`);
   console.log(`  CLI Verification      : 2`);
   console.log(`  Negative Error Tests  : ${negPassed}`);
+  console.log(`  LIR GC Safety Checks  : ${lirPassed}`);
   console.log(`  Contract Coverage     : ${allContractCodes.length}/${allContractCodes.length} (100%)`);
   console.log("========================================================\n");
 

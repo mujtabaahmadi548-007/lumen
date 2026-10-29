@@ -77,11 +77,17 @@ function createHostEnv(options = {}) {
    * - +8: `byte_len = utf8.length`
    * - +12: UTF-8 bytes
    */
-  function allocStringInMemory(str) {
-    const utf8 = textEncoder.encode(String(str));
-    const byteLen = utf8.length;
-    const payloadSize = alignUp(4 + byteLen, 8);
-    const totalSize = GC_HEADER_SIZE + payloadSize;
+  /**
+   * Allocate a generic heap object on the Wasm heap (`__heap_top`) in canonical layout:
+   * - +0: `gc_flags = GC_FLAGS.NONE`
+   * - +1: `obj_kind`
+   * - +2: `type_desc_id`
+   * - +4: `payload_size` (aligned to 8 bytes)
+   * - +8..: zero-filled payload
+   */
+  function allocObjectInMemory(objKind, typeDescId, payloadSize) {
+    const alignedPayload = alignUp(payloadSize >>> 0, 8);
+    const totalSize = GC_HEADER_SIZE + alignedPayload;
 
     const heapTopGlobal = wasmInstance.exports.__heap_top;
     const baseAddr = heapTopGlobal
@@ -107,13 +113,29 @@ function createHostEnv(options = {}) {
     const view = getMemoryView();
     mem.fill(0, baseAddr, nextTop);
     mem[baseAddr] = GC_FLAGS.NONE;
-    mem[baseAddr + 1] = OBJ_KIND.STRING;
-    view.setUint16(baseAddr + 2, 0, true);
-    view.setUint32(baseAddr + 4, payloadSize, true);
-    view.setUint32(baseAddr + 8, byteLen, true);
-    mem.set(utf8, baseAddr + 12);
+    mem[baseAddr + 1] = objKind & 0xff;
+    view.setUint16(baseAddr + 2, typeDescId & 0xffff, true);
+    view.setUint32(baseAddr + 4, alignedPayload, true);
 
     return baseAddr;
+  }
+
+  function allocStringFromBytes(bytes) {
+    const byteLen = bytes.length;
+    const baseAddr = allocObjectInMemory(
+      OBJ_KIND.STRING,
+      0,
+      alignUp(4 + byteLen, 8)
+    );
+    const view = getMemoryView();
+    view.setUint32(baseAddr + 8, byteLen, true);
+    const mem = getMemoryBytes();
+    mem.set(bytes, baseAddr + 12);
+    return baseAddr;
+  }
+
+  function allocStringInMemory(str) {
+    return allocStringFromBytes(textEncoder.encode(String(str ?? "")));
   }
 
   const env = {
@@ -188,29 +210,53 @@ function createHostEnv(options = {}) {
       return 1;
     },
 
+    __lumen_alloc(objKind, typeDescId, payloadSize) {
+      return allocObjectInMemory(objKind, typeDescId, payloadSize);
+    },
+
+    __lumen_grow_array(arrPtr, minCap) {
+      const arr = arrPtr >>> 0;
+      if (!arr) throw new LumenRuntimeError("index out of bounds");
+      const view = getMemoryView();
+      const curCap = view.getInt32(arr + 12, true);
+      const curLen = view.getInt32(arr + 8, true);
+      const oldBuf = view.getInt32(arr + 16, true);
+      const newCap = Math.max(curCap <= 0 ? 4 : curCap * 2, minCap | 0);
+      const newBuf = allocObjectInMemory(OBJ_KIND.RAW_BUFFER, 0, newCap * 8);
+      if (oldBuf && curLen > 0) {
+        const mem = getMemoryBytes();
+        const copyBytes = Math.min(curLen, curCap) * 8;
+        mem.copyWithin(newBuf + 8, oldBuf + 8, oldBuf + 8 + copyBytes);
+      }
+      const updatedView = getMemoryView();
+      updatedView.setInt32(arr + 12, newCap, true);
+      updatedView.setInt32(arr + 16, newBuf, true);
+      return newBuf;
+    },
+
     __lumen_str_slice(strPtr, start, end) {
       const ptr = strPtr >>> 0;
-      if (!ptr) throw new LumenRuntimeError("string slice out of bounds");
+      if (!ptr) throw new LumenRuntimeError("index out of bounds");
       const mem = getMemoryBytes();
       const view = getMemoryView();
       const byteLen = view.getUint32(ptr + 8, true);
       const s = start | 0;
       const e = end | 0;
       if (s < 0 || e < s || e > byteLen) {
-        throw new LumenRuntimeError("string slice out of bounds");
+        throw new LumenRuntimeError("index out of bounds");
       }
       const slicedBytes = mem.subarray(ptr + 12 + s, ptr + 12 + e);
-      return allocStringInMemory(textDecoder.decode(slicedBytes));
+      return allocStringFromBytes(slicedBytes);
     },
 
     __lumen_str_char_at(strPtr, idx) {
       const ptr = strPtr >>> 0;
-      if (!ptr) throw new LumenRuntimeError("string index out of bounds");
+      if (!ptr) throw new LumenRuntimeError("index out of bounds");
       const view = getMemoryView();
       const byteLen = view.getUint32(ptr + 8, true);
       const i = idx | 0;
       if (i < 0 || i >= byteLen) {
-        throw new LumenRuntimeError("string index out of bounds");
+        throw new LumenRuntimeError("index out of bounds");
       }
       const mem = getMemoryBytes();
       return mem[ptr + 12 + i] & 0xff;

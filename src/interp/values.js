@@ -264,7 +264,7 @@ export function strSliceBytes(str, start, end) {
   if (st < 0 || en < st || en > bytes.length) {
     throw new LumenRuntimeError("index out of bounds");
   }
-  return fromUtf8Bytes(bytes.subarray(st, en));
+  return new Uint8Array(bytes.subarray(st, en));
 }
 
 export function strCharAtByte(str, index) {

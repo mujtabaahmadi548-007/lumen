@@ -404,6 +404,16 @@ export function emitWasm(lirModule, options = {}) {
     []
   );
   const impTrap = addHostImport("__lumen_trap", [WasmValType.I32], []);
+  const impAlloc = addHostImport(
+    "__lumen_alloc",
+    [WasmValType.I32, WasmValType.I32, WasmValType.I32],
+    [WasmValType.I32]
+  );
+  const impGrowArray = addHostImport(
+    "__lumen_grow_array",
+    [WasmValType.I32, WasmValType.I32],
+    [WasmValType.I32]
+  );
 
   let impDebugStep = -1;
   if (debug) {
@@ -549,7 +559,7 @@ export function emitWasm(lirModule, options = {}) {
         return localIdToWasmIdx.get(lid);
       }
       const wasmIdx = params.length + nonParamLocalValTypes.length;
-      const lType = lirType || "i32";
+      const lType = (!lirType || lirType === "void") ? "i32" : lirType;
       nonParamLocalValTypes.push(lirTypeToWasmValType(lType));
       if (lid !== undefined) {
         localIdToWasmIdx.set(lid, wasmIdx);
@@ -793,7 +803,11 @@ export function emitWasm(lirModule, options = {}) {
           }
 
           // String concatenation, equality, and lexicographical comparisons
-          if (operandType === "gc_ref" && (kind === "+" || kind === "add" || kind === "str_concat")) {
+          if (
+            operandType === "gc_ref" &&
+            (expr.type === "gc_ref" || kind === "str_concat") &&
+            (kind === "+" || kind === "add" || kind === "str_concat")
+          ) {
             emitExpr(expr.left);
             emitExpr(expr.right);
             bodyBuf.writeByte(WasmOp.call).writeU32(impStrConcat);
@@ -1136,11 +1150,24 @@ export function emitWasm(lirModule, options = {}) {
           break;
         }
 
+        case "gc_alloc": {
+          bodyBuf.writeByte(WasmOp.i32_const).writeS32(expr.objKind | 0);
+          bodyBuf.writeByte(WasmOp.i32_const).writeS32((expr.typeDescId || 0) | 0);
+          emitExpr(expr.payloadSize);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impAlloc);
+          break;
+        }
+
         case "seq": {
           for (const s of expr.stmts || []) {
             emitStmt(s);
           }
-          emitExpr(expr.result);
+          if (expr.type !== "void" && expr.result) {
+            emitExpr(expr.result);
+          } else if (expr.result && expr.result.type && expr.result.type !== "void") {
+            emitExpr(expr.result);
+            bodyBuf.writeByte(WasmOp.drop);
+          }
           break;
         }
 
@@ -1386,6 +1413,18 @@ export function emitWasm(lirModule, options = {}) {
               .writeByte(WasmOp.i32_const)
               .writeS32(stringIdToPtr.get(assertFailStrId));
           }
+          bodyBuf.writeByte(WasmOp.call).writeU32(impTrap);
+          bodyBuf.writeByte(WasmOp.unreachable);
+          break;
+
+        case "grow_array":
+          emitExpr(args[0]);
+          emitExpr(args[1]);
+          bodyBuf.writeByte(WasmOp.call).writeU32(impGrowArray);
+          break;
+
+        case "trap":
+          emitExpr(args[0]);
           bodyBuf.writeByte(WasmOp.call).writeU32(impTrap);
           bodyBuf.writeByte(WasmOp.unreachable);
           break;

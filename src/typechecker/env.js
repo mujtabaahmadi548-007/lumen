@@ -461,6 +461,10 @@ export class TypeEnv {
    * Look up an enum variant either qualified (`enumName, variantName`) or unqualified (`null, variantName`).
    */
   lookupVariant(enumName, variantName) {
+    if (variantName === undefined) {
+      variantName = enumName;
+      enumName = null;
+    }
     if (enumName) {
       const enumDef = this.enums.get(enumName);
       if (!enumDef) return null;

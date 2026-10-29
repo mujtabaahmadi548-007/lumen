@@ -66,6 +66,8 @@ const BUILTIN_RETURN_LIR_TYPES = Object.freeze({
   clock_ms: "f64",
   assert: "void",
   panic: "void",
+  grow_array: "gc_ref",
+  trap: "void",
 });
 
 const COMPARISON_AND_LOGICAL_OPS = new Set([
@@ -719,6 +721,130 @@ class ModuleLowerer {
             value: finalValue,
             span: stmt.span,
           });
+        } else if (stmt.target.kind === "FieldExpr") {
+          const objLir = this.lowerExpr(stmt.target.object, fnCtx);
+          const rhsLir = this.lowerExpr(stmt.value, fnCtx);
+          const objLocal = this.allocTempLocal(fnCtx, "gc_ref", "$obj");
+          const valLirType = this.inferExprLirType(stmt.value, fnCtx);
+          const valLocal = this.allocTempLocal(fnCtx, valLirType, "$val");
+          out.push({ op: "local_set", localId: objLocal.localId, value: objLir });
+          out.push({ op: "local_set", localId: valLocal.localId, value: rhsLir });
+
+          let fieldIndex = stmt.target.fieldIndex;
+          if (fieldIndex === undefined) {
+            const objType = unwrapType(stmt.target.object.inferredType);
+            if (objType && objType.tag === "struct" && this.env) {
+              const def = this.env.getStruct(objType.name);
+              if (def) fieldIndex = def.fields.findIndex((f) => f.name === stmt.target.field);
+            }
+          }
+          const offset = 8 + 8 * (fieldIndex !== undefined && fieldIndex >= 0 ? fieldIndex : 0);
+          out.push({
+            op: "mem_store",
+            ptr: { op: "local_get", localId: objLocal.localId, type: "gc_ref" },
+            offset,
+            value: { op: "local_get", localId: valLocal.localId, type: valLirType },
+            storeType: valLirType,
+          });
+        } else if (stmt.target.kind === "IndexExpr") {
+          const arrLir = this.lowerExpr(stmt.target.object, fnCtx);
+          const idxLir = this.lowerExpr(stmt.target.index, fnCtx);
+          const rhsLir = this.lowerExpr(stmt.value, fnCtx);
+          const arrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$arr");
+          const idxLocal = this.allocTempLocal(fnCtx, "i32", "$idx");
+          const valLirType = this.inferExprLirType(stmt.value, fnCtx);
+          const valLocal = this.allocTempLocal(fnCtx, valLirType, "$val");
+
+          out.push({ op: "local_set", localId: arrLocal.localId, value: arrLir });
+          out.push({ op: "local_set", localId: idxLocal.localId, value: idxLir });
+          out.push({ op: "local_set", localId: valLocal.localId, value: rhsLir });
+
+          // Bounds check
+          const lenLocal = this.allocTempLocal(fnCtx, "i32", "$len");
+          out.push({
+            op: "local_set",
+            localId: lenLocal.localId,
+            value: {
+              op: "mem_load",
+              ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+              offset: 8,
+              loadType: "i32",
+              type: "i32",
+            },
+          });
+
+          const isOob = {
+            op: "binop",
+            kind: "or",
+            left: {
+              op: "binop",
+              kind: "lt_s",
+              left: { op: "local_get", localId: idxLocal.localId, type: "i32" },
+              right: { op: "const_i32", value: 0, type: "i32" },
+              type: "i32",
+            },
+            right: {
+              op: "binop",
+              kind: "ge_s",
+              left: { op: "local_get", localId: idxLocal.localId, type: "i32" },
+              right: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+              type: "i32",
+            },
+            type: "i32",
+          };
+
+          out.push({
+            op: "if",
+            cond: isOob,
+            thenBody: [
+              {
+                op: "expr",
+                expr: {
+                  op: "call_builtin",
+                  builtin: "trap",
+                  args: [{ op: "const_i32", value: 3, type: "i32" }],
+                  type: "void",
+                },
+              },
+            ],
+            elseBody: [],
+          });
+
+          // Load buffer at +16
+          const bufLocal = this.allocTempLocal(fnCtx, "gc_ref", "$buf");
+          out.push({
+            op: "local_set",
+            localId: bufLocal.localId,
+            value: {
+              op: "mem_load",
+              ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+              offset: 16,
+              loadType: "gc_ref",
+              type: "gc_ref",
+            },
+          });
+
+          const effectivePtr = {
+            op: "binop",
+            kind: "add",
+            left: { op: "local_get", localId: bufLocal.localId, type: "gc_ref" },
+            right: {
+              op: "binop",
+              kind: "mul",
+              left: { op: "local_get", localId: idxLocal.localId, type: "i32" },
+              right: { op: "const_i32", value: 8, type: "i32" },
+              type: "i32",
+            },
+            type: "i32",
+          };
+
+          out.push({
+            op: "mem_store",
+            ptr: effectivePtr,
+            offset: 8,
+            value: { op: "local_get", localId: valLocal.localId, type: valLirType },
+            storeType: valLirType,
+          });
         }
         break;
       }
@@ -1016,6 +1142,15 @@ class ModuleLowerer {
         }
         return "void";
       }
+      case "StructLitExpr":
+      case "EnumInitExpr":
+      case "ArrayLitExpr":
+        return "gc_ref";
+      case "FieldExpr":
+      case "IndexExpr":
+      case "MatchExpr":
+      case "MatchStmt":
+        return expr.inferredType ? semanticTypeToLirType(expr.inferredType) : "i32";
       default:
         return "i32";
     }
@@ -1171,6 +1306,267 @@ class ModuleLowerer {
                 },
                 type: "void",
               };
+            }
+
+            if (fnName === "array_len") {
+              const arrLir = rawArgs[0];
+              const rootedArr = this.ensureRootedGcExpr(arrLir, fnCtx);
+              return {
+                op: "mem_load",
+                ptr: rootedArr,
+                offset: 8,
+                loadType: "i32",
+                type: "i32",
+              };
+            }
+
+            if (fnName === "array_push") {
+              const stmts = [];
+              const arrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$arr");
+              const valLirType = rawArgs[1].type || "i32";
+              const valLocal = this.allocTempLocal(fnCtx, valLirType, "$val");
+              stmts.push({ op: "local_set", localId: arrLocal.localId, value: rawArgs[0] });
+              stmts.push({ op: "local_set", localId: valLocal.localId, value: rawArgs[1] });
+
+              const lenLocal = this.allocTempLocal(fnCtx, "i32", "$len");
+              const capLocal = this.allocTempLocal(fnCtx, "i32", "$cap");
+              stmts.push({
+                op: "local_set",
+                localId: lenLocal.localId,
+                value: {
+                  op: "mem_load",
+                  ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                  offset: 8,
+                  loadType: "i32",
+                  type: "i32",
+                },
+              });
+              stmts.push({
+                op: "local_set",
+                localId: capLocal.localId,
+                value: {
+                  op: "mem_load",
+                  ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                  offset: 12,
+                  loadType: "i32",
+                  type: "i32",
+                },
+              });
+
+              // if len >= cap: grow_array
+              const needsGrow = {
+                op: "binop",
+                kind: "ge_s",
+                left: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+                right: { op: "local_get", localId: capLocal.localId, type: "i32" },
+                type: "i32",
+              };
+              stmts.push({
+                op: "if",
+                cond: needsGrow,
+                thenBody: [
+                  {
+                    op: "expr",
+                    expr: {
+                      op: "call_builtin",
+                      builtin: "grow_array",
+                      args: [
+                        { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                        {
+                          op: "binop",
+                          kind: "add",
+                          left: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+                          right: { op: "const_i32", value: 1, type: "i32" },
+                          type: "i32",
+                        },
+                      ],
+                      type: "gc_ref",
+                    },
+                  },
+                ],
+                elseBody: [],
+              });
+
+              // buf = arr + 16
+              const bufLocal = this.allocTempLocal(fnCtx, "gc_ref", "$buf");
+              stmts.push({
+                op: "local_set",
+                localId: bufLocal.localId,
+                value: {
+                  op: "mem_load",
+                  ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                  offset: 16,
+                  loadType: "gc_ref",
+                  type: "gc_ref",
+                },
+              });
+
+              // mem_store val into buf + 8 + 8 * len
+              const effectivePtr = {
+                op: "binop",
+                kind: "add",
+                left: { op: "local_get", localId: bufLocal.localId, type: "gc_ref" },
+                right: {
+                  op: "binop",
+                  kind: "mul",
+                  left: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+                  right: { op: "const_i32", value: 8, type: "i32" },
+                  type: "i32",
+                },
+                type: "i32",
+              };
+              stmts.push({
+                op: "mem_store",
+                ptr: effectivePtr,
+                offset: 8,
+                value: { op: "local_get", localId: valLocal.localId, type: valLirType },
+                storeType: valLirType,
+              });
+
+              // len = len + 1
+              stmts.push({
+                op: "mem_store",
+                ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                offset: 8,
+                value: {
+                  op: "binop",
+                  kind: "add",
+                  left: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+                  right: { op: "const_i32", value: 1, type: "i32" },
+                  type: "i32",
+                },
+                storeType: "i32",
+              });
+
+              return {
+                op: "seq",
+                stmts,
+                result: { op: "const_i32", value: 0, type: "void" },
+                type: "void",
+              };
+            }
+
+            if (fnName === "array_pop") {
+              const stmts = [];
+              const arrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$arr");
+              stmts.push({ op: "local_set", localId: arrLocal.localId, value: rawArgs[0] });
+
+              const lenLocal = this.allocTempLocal(fnCtx, "i32", "$len");
+              stmts.push({
+                op: "local_set",
+                localId: lenLocal.localId,
+                value: {
+                  op: "mem_load",
+                  ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                  offset: 8,
+                  loadType: "i32",
+                  type: "i32",
+                },
+              });
+
+              // if len <= 0: trap(7) ("pop from empty array")
+              const isEmpty = {
+                op: "binop",
+                kind: "le_s",
+                left: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+                right: { op: "const_i32", value: 0, type: "i32" },
+                type: "i32",
+              };
+              stmts.push({
+                op: "if",
+                cond: isEmpty,
+                thenBody: [
+                  {
+                    op: "expr",
+                    expr: {
+                      op: "call_builtin",
+                      builtin: "trap",
+                      args: [{ op: "const_i32", value: 7, type: "i32" }],
+                      type: "void",
+                    },
+                  },
+                ],
+                elseBody: [],
+              });
+
+              // newLen = len - 1
+              const newLenLocal = this.allocTempLocal(fnCtx, "i32", "$new_len");
+              stmts.push({
+                op: "local_set",
+                localId: newLenLocal.localId,
+                value: {
+                  op: "binop",
+                  kind: "sub",
+                  left: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+                  right: { op: "const_i32", value: 1, type: "i32" },
+                  type: "i32",
+                },
+              });
+
+              // Store newLen at arr + 8
+              stmts.push({
+                op: "mem_store",
+                ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                offset: 8,
+                value: { op: "local_get", localId: newLenLocal.localId, type: "i32" },
+                storeType: "i32",
+              });
+
+              // buf = arr + 16
+              const bufLocal = this.allocTempLocal(fnCtx, "gc_ref", "$buf");
+              stmts.push({
+                op: "local_set",
+                localId: bufLocal.localId,
+                value: {
+                  op: "mem_load",
+                  ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+                  offset: 16,
+                  loadType: "gc_ref",
+                  type: "gc_ref",
+                },
+              });
+
+              const elemLirType = this.inferExprLirType(expr, fnCtx);
+              const effectivePtr = {
+                op: "binop",
+                kind: "add",
+                left: { op: "local_get", localId: bufLocal.localId, type: "gc_ref" },
+                right: {
+                  op: "binop",
+                  kind: "mul",
+                  left: { op: "local_get", localId: newLenLocal.localId, type: "i32" },
+                  right: { op: "const_i32", value: 8, type: "i32" },
+                  type: "i32",
+                },
+                type: "i32",
+              };
+
+              const resLocal = this.allocTempLocal(fnCtx, elemLirType, "$popped");
+              stmts.push({
+                op: "local_set",
+                localId: resLocal.localId,
+                value: {
+                  op: "mem_load",
+                  ptr: effectivePtr,
+                  offset: 8,
+                  loadType: elemLirType,
+                  type: elemLirType,
+                },
+              });
+
+              return {
+                op: "seq",
+                stmts,
+                result: { op: "local_get", localId: resLocal.localId, type: elemLirType },
+                type: elemLirType,
+              };
+            }
+
+            if (fnName === "array_new") {
+              return this.lowerExpr(
+                { kind: "ArrayLitExpr", elements: [], inferredType: expr.inferredType },
+                fnCtx
+              );
             }
 
             const safeArgs = this.stabilizeExprListForGc(rawArgs, fnCtx);
@@ -1475,8 +1871,690 @@ class ModuleLowerer {
         };
       }
 
+      case "StructLitExpr": {
+        const stmts = [];
+        const structName = expr.structName;
+        const structDef = this.env ? this.env.getStruct(structName) : null;
+        const fieldNodes = expr.fields || [];
+
+        const orderedFieldValues = [];
+        if (structDef && structDef.fields) {
+          for (let i = 0; i < structDef.fields.length; i++) {
+            const df = structDef.fields[i];
+            const found = fieldNodes.find((f) => f.name === df.name);
+            const valExpr = found
+              ? found.value !== undefined
+                ? found.value
+                : found.expr
+              : null;
+            orderedFieldValues.push({
+              name: df.name,
+              astVal: valExpr,
+              lirType: semanticTypeToLirType(df.type),
+            });
+          }
+        } else {
+          for (const f of fieldNodes) {
+            orderedFieldValues.push({
+              name: f.name,
+              astVal: f.value !== undefined ? f.value : f.expr,
+              lirType: this.inferExprLirType(f.value || f.expr, fnCtx),
+            });
+          }
+        }
+
+        // Rule 11 (Allocate-then-fill): evaluate field values into locals first!
+        const fieldLocals = [];
+        for (let i = 0; i < orderedFieldValues.length; i++) {
+          const item = orderedFieldValues[i];
+          const valLir = this.lowerExpr(item.astVal, fnCtx);
+          const tmp = this.allocTempLocal(fnCtx, item.lirType, `$f_${item.name}`);
+          stmts.push({ op: "local_set", localId: tmp.localId, value: valLir });
+          fieldLocals.push({ ...item, local: tmp });
+        }
+
+        const payloadSize = orderedFieldValues.length * 8;
+        const structPtrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$struct");
+        stmts.push({
+          op: "local_set",
+          localId: structPtrLocal.localId,
+          value: {
+            op: "gc_alloc",
+            objKind: OBJ_KIND.STRUCT,
+            typeDescId: 0,
+            payloadSize: { op: "const_i32", value: payloadSize, type: "i32" },
+            type: "gc_ref",
+          },
+        });
+
+        for (let i = 0; i < fieldLocals.length; i++) {
+          const fl = fieldLocals[i];
+          stmts.push({
+            op: "mem_store",
+            ptr: { op: "local_get", localId: structPtrLocal.localId, type: "gc_ref" },
+            offset: 8 + 8 * i,
+            value: { op: "local_get", localId: fl.local.localId, type: fl.lirType },
+            storeType: fl.lirType,
+          });
+        }
+
+        return {
+          op: "seq",
+          stmts,
+          result: {
+            op: "local_get",
+            localId: structPtrLocal.localId,
+            type: "gc_ref",
+          },
+          type: "gc_ref",
+        };
+      }
+
+      case "FieldExpr": {
+        const objLir = this.lowerExpr(expr.object, fnCtx);
+        const rootedObj = this.ensureRootedGcExpr(objLir, fnCtx);
+        let fieldIndex = expr.fieldIndex;
+        let fieldLirType = this.inferExprLirType(expr, fnCtx);
+        if (fieldIndex === undefined) {
+          const objType = unwrapType(expr.object.inferredType);
+          if (objType && objType.tag === "struct" && this.env) {
+            const def = this.env.getStruct(objType.name);
+            if (def) {
+              fieldIndex = def.fields.findIndex((f) => f.name === expr.field);
+              if (fieldIndex !== -1) {
+                fieldLirType = semanticTypeToLirType(def.fields[fieldIndex].type);
+              }
+            }
+          }
+        }
+        const offset = 8 + 8 * (fieldIndex !== undefined && fieldIndex >= 0 ? fieldIndex : 0);
+        return {
+          op: "mem_load",
+          ptr: rootedObj,
+          offset,
+          loadType: fieldLirType,
+          type: fieldLirType,
+        };
+      }
+
+      case "EnumInitExpr": {
+        const stmts = [];
+        const variantName = expr.variantName;
+        let enumName = expr.enumName;
+        let tagIndex = expr.tagIndex !== undefined ? expr.tagIndex : 0;
+        let variantDef = null;
+
+        if (this.env) {
+          if (!enumName) {
+            const vInfo = this.env.lookupVariant(variantName);
+            if (vInfo) enumName = vInfo.enumName;
+          }
+          if (enumName) {
+            const enumDef = this.env.getEnum(enumName);
+            if (enumDef) {
+              const v = enumDef.variants.find((item) => item.name === variantName);
+              if (v) {
+                tagIndex = v.tagIndex;
+                variantDef = v;
+              }
+            }
+          }
+        }
+
+        const args = expr.args || [];
+        const argLocals = [];
+        for (let i = 0; i < args.length; i++) {
+          const arg = args[i];
+          const argLir = this.lowerExpr(arg, fnCtx);
+          const lirType =
+            variantDef && variantDef.fields && variantDef.fields[i]
+              ? semanticTypeToLirType(variantDef.fields[i])
+              : this.inferExprLirType(arg, fnCtx);
+          const tmp = this.allocTempLocal(fnCtx, lirType, `$arg_${i}`);
+          stmts.push({ op: "local_set", localId: tmp.localId, value: argLir });
+          argLocals.push({ local: tmp, lirType });
+        }
+
+        const payloadSize = 8 + args.length * 8;
+        const enumPtrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$enum");
+        stmts.push({
+          op: "local_set",
+          localId: enumPtrLocal.localId,
+          value: {
+            op: "gc_alloc",
+            objKind: OBJ_KIND.ENUM,
+            typeDescId: 0,
+            payloadSize: { op: "const_i32", value: payloadSize, type: "i32" },
+            type: "gc_ref",
+          },
+        });
+
+        stmts.push({
+          op: "mem_store",
+          ptr: { op: "local_get", localId: enumPtrLocal.localId, type: "gc_ref" },
+          offset: 8,
+          value: { op: "const_i32", value: tagIndex, type: "i32" },
+          storeType: "i32",
+        });
+
+        for (let i = 0; i < argLocals.length; i++) {
+          const al = argLocals[i];
+          stmts.push({
+            op: "mem_store",
+            ptr: { op: "local_get", localId: enumPtrLocal.localId, type: "gc_ref" },
+            offset: 16 + 8 * i,
+            value: { op: "local_get", localId: al.local.localId, type: al.lirType },
+            storeType: al.lirType,
+          });
+        }
+
+        return {
+          op: "seq",
+          stmts,
+          result: { op: "local_get", localId: enumPtrLocal.localId, type: "gc_ref" },
+          type: "gc_ref",
+        };
+      }
+
+      case "ArrayLitExpr": {
+        const stmts = [];
+        const elements = expr.elements || [];
+        let elemLirType = "i32";
+        if (expr.inferredType) {
+          const ty = unwrapType(expr.inferredType);
+          if (ty && ty.tag === "array") {
+            elemLirType = semanticTypeToLirType(ty.elem);
+          }
+        }
+
+        const elemLocals = [];
+        for (let i = 0; i < elements.length; i++) {
+          const e = elements[i];
+          const valLir = this.lowerExpr(e, fnCtx);
+          const tmp = this.allocTempLocal(fnCtx, elemLirType, `$elem_${i}`);
+          stmts.push({ op: "local_set", localId: tmp.localId, value: valLir });
+          elemLocals.push(tmp);
+        }
+
+        const cap = Math.max(elements.length, 4);
+        const bufPtrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$buf");
+        stmts.push({
+          op: "local_set",
+          localId: bufPtrLocal.localId,
+          value: {
+            op: "gc_alloc",
+            objKind: OBJ_KIND.RAW_BUFFER,
+            typeDescId: 0,
+            payloadSize: { op: "const_i32", value: cap * 8, type: "i32" },
+            type: "gc_ref",
+          },
+        });
+
+        for (let i = 0; i < elemLocals.length; i++) {
+          stmts.push({
+            op: "mem_store",
+            ptr: { op: "local_get", localId: bufPtrLocal.localId, type: "gc_ref" },
+            offset: 8 + 8 * i,
+            value: { op: "local_get", localId: elemLocals[i].localId, type: elemLirType },
+            storeType: elemLirType,
+          });
+        }
+
+        const arrPtrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$arr");
+        stmts.push({
+          op: "local_set",
+          localId: arrPtrLocal.localId,
+          value: {
+            op: "gc_alloc",
+            objKind: OBJ_KIND.ARRAY,
+            typeDescId: 0,
+            payloadSize: { op: "const_i32", value: 16, type: "i32" },
+            type: "gc_ref",
+          },
+        });
+
+        stmts.push({
+          op: "mem_store",
+          ptr: { op: "local_get", localId: arrPtrLocal.localId, type: "gc_ref" },
+          offset: 8,
+          value: { op: "const_i32", value: elements.length, type: "i32" },
+          storeType: "i32",
+        });
+
+        stmts.push({
+          op: "mem_store",
+          ptr: { op: "local_get", localId: arrPtrLocal.localId, type: "gc_ref" },
+          offset: 12,
+          value: { op: "const_i32", value: cap, type: "i32" },
+          storeType: "i32",
+        });
+
+        stmts.push({
+          op: "mem_store",
+          ptr: { op: "local_get", localId: arrPtrLocal.localId, type: "gc_ref" },
+          offset: 16,
+          value: { op: "local_get", localId: bufPtrLocal.localId, type: "gc_ref" },
+          storeType: "gc_ref",
+        });
+
+        return {
+          op: "seq",
+          stmts,
+          result: { op: "local_get", localId: arrPtrLocal.localId, type: "gc_ref" },
+          type: "gc_ref",
+        };
+      }
+
+      case "IndexExpr": {
+        const stmts = [];
+        const arrLir = this.lowerExpr(expr.object, fnCtx);
+        const idxLir = this.lowerExpr(expr.index, fnCtx);
+
+        const arrLocal = this.allocTempLocal(fnCtx, "gc_ref", "$arr");
+        const idxLocal = this.allocTempLocal(fnCtx, "i32", "$idx");
+        stmts.push({ op: "local_set", localId: arrLocal.localId, value: arrLir });
+        stmts.push({ op: "local_set", localId: idxLocal.localId, value: idxLir });
+
+        const lenLocal = this.allocTempLocal(fnCtx, "i32", "$len");
+        stmts.push({
+          op: "local_set",
+          localId: lenLocal.localId,
+          value: {
+            op: "mem_load",
+            ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+            offset: 8,
+            loadType: "i32",
+            type: "i32",
+          },
+        });
+
+        const isOob = {
+          op: "binop",
+          kind: "or",
+          left: {
+            op: "binop",
+            kind: "lt_s",
+            left: { op: "local_get", localId: idxLocal.localId, type: "i32" },
+            right: { op: "const_i32", value: 0, type: "i32" },
+            type: "i32",
+          },
+          right: {
+            op: "binop",
+            kind: "ge_s",
+            left: { op: "local_get", localId: idxLocal.localId, type: "i32" },
+            right: { op: "local_get", localId: lenLocal.localId, type: "i32" },
+            type: "i32",
+          },
+          type: "i32",
+        };
+
+        stmts.push({
+          op: "if",
+          cond: isOob,
+          thenBody: [
+            {
+              op: "expr",
+              expr: {
+                op: "call_builtin",
+                builtin: "trap",
+                args: [{ op: "const_i32", value: 3, type: "i32" }],
+                type: "void",
+              },
+            },
+          ],
+          elseBody: [],
+        });
+
+        const bufLocal = this.allocTempLocal(fnCtx, "gc_ref", "$buf");
+        stmts.push({
+          op: "local_set",
+          localId: bufLocal.localId,
+          value: {
+            op: "mem_load",
+            ptr: { op: "local_get", localId: arrLocal.localId, type: "gc_ref" },
+            offset: 16,
+            loadType: "gc_ref",
+            type: "gc_ref",
+          },
+        });
+
+        let elemLirType = "i32";
+        if (expr.inferredType) {
+          elemLirType = semanticTypeToLirType(expr.inferredType);
+        }
+
+        const effectivePtr = {
+          op: "binop",
+          kind: "add",
+          left: { op: "local_get", localId: bufLocal.localId, type: "gc_ref" },
+          right: {
+            op: "binop",
+            kind: "mul",
+            left: { op: "local_get", localId: idxLocal.localId, type: "i32" },
+            right: { op: "const_i32", value: 8, type: "i32" },
+            type: "i32",
+          },
+          type: "i32",
+        };
+
+        const resLocal = this.allocTempLocal(fnCtx, elemLirType, "$elem");
+        stmts.push({
+          op: "local_set",
+          localId: resLocal.localId,
+          value: {
+            op: "mem_load",
+            ptr: effectivePtr,
+            offset: 8,
+            loadType: elemLirType,
+            type: elemLirType,
+          },
+        });
+
+        return {
+          op: "seq",
+          stmts,
+          result: { op: "local_get", localId: resLocal.localId, type: elemLirType },
+          type: elemLirType,
+        };
+      }
+
+      case "MatchExpr":
+      case "MatchStmt": {
+        const stmts = [];
+        const scrutineeNode = expr.scrutinee || expr.expr;
+        const scrutineeLir = this.lowerExpr(scrutineeNode, fnCtx);
+        const scrutineeType = this.inferExprLirType(scrutineeNode, fnCtx);
+        const scrutineeLocal = this.allocTempLocal(fnCtx, scrutineeType, "$scrutinee");
+        stmts.push({
+          op: "local_set",
+          localId: scrutineeLocal.localId,
+          value: scrutineeLir,
+        });
+
+        const resultType = this.inferExprLirType(expr, fnCtx);
+        const isVoid = resultType === "void";
+        const resultLocal = isVoid ? null : this.allocTempLocal(fnCtx, resultType, "$match_res");
+        const arms = expr.arms || [];
+
+        let currentElseBody = [];
+        for (let i = 0; i < arms.length; i++) {
+          const arm = arms[i];
+          const bindStmts = [];
+          this.pushScope(fnCtx);
+
+          const patCond = this.lowerPatternMatch(
+            arm.pattern,
+            { op: "local_get", localId: scrutineeLocal.localId, type: scrutineeType },
+            fnCtx,
+            bindStmts
+          );
+
+          let fullCond = patCond;
+          if (arm.guard) {
+            const guardLir = this.lowerExpr(arm.guard, fnCtx);
+            fullCond = {
+              op: "if_expr",
+              cond: patCond,
+              thenStmts: bindStmts,
+              thenExpr: guardLir,
+              elseStmts: [],
+              elseExpr: { op: "const_i32", value: 0, type: "i32" },
+              type: "i32",
+            };
+          }
+
+          const armStmts = [...bindStmts];
+
+          if (arm.body) {
+            if (arm.body.kind === "BlockExpr" || arm.body.kind === "BlockStmt") {
+              const bodyStmts = this.lowerBlockStmts(arm.body.block || arm.body, fnCtx);
+              armStmts.push(...bodyStmts);
+              const tail = (arm.body.block || arm.body).tailExpr;
+              if (tail) {
+                const tailLir = this.lowerExpr(tail, fnCtx);
+                if (!isVoid && resultLocal) {
+                  armStmts.push({
+                    op: "local_set",
+                    localId: resultLocal.localId,
+                    value: tailLir,
+                  });
+                } else {
+                  armStmts.push({ op: "expr", expr: tailLir });
+                }
+              }
+            } else {
+              const bodyLir = this.lowerExpr(arm.body, fnCtx);
+              if (!isVoid && resultLocal) {
+                armStmts.push({
+                  op: "local_set",
+                  localId: resultLocal.localId,
+                  value: bodyLir,
+                });
+              } else {
+                armStmts.push({ op: "expr", expr: bodyLir });
+              }
+            }
+          }
+
+          this.popScope(fnCtx);
+
+          const ifStmt = {
+            op: "if",
+            cond: fullCond,
+            thenBody: armStmts,
+            elseBody: [],
+          };
+
+          if (i === 0) {
+            stmts.push(ifStmt);
+          } else {
+            currentElseBody.push(ifStmt);
+          }
+          currentElseBody = ifStmt.elseBody;
+        }
+
+        return {
+          op: "seq",
+          stmts,
+          result: isVoid
+            ? { op: "const_i32", value: 0, type: "void" }
+            : {
+                op: "local_get",
+                localId: resultLocal.localId,
+                type: resultType,
+              },
+          type: resultType,
+        };
+      }
+
       default:
         return { op: "const_i32", value: 0, type: "i32" };
+    }
+  }
+
+  lowerPatternMatch(pattern, targetLir, fnCtx, bindStmts) {
+    if (!pattern) return { op: "const_i32", value: 1, type: "i32" };
+
+    switch (pattern.kind) {
+      case "WildcardPattern":
+        return { op: "const_i32", value: 1, type: "i32" };
+
+      case "VarPattern": {
+        const lirType = pattern.inferredType
+          ? semanticTypeToLirType(pattern.inferredType)
+          : targetLir.type || "i32";
+        const localDesc = this.allocLocal(
+          fnCtx,
+          pattern.name,
+          lirType,
+          Boolean(pattern.mutable)
+        );
+        this.defineVar(fnCtx, pattern.name, localDesc);
+        bindStmts.push({
+          op: "local_set",
+          localId: localDesc.localId,
+          value: targetLir,
+        });
+        return { op: "const_i32", value: 1, type: "i32" };
+      }
+
+      case "LiteralPattern": {
+        const litNode = pattern.literal || pattern;
+        const litType =
+          litNode.literalType ||
+          (litNode.inferredType ? litNode.inferredType.name : "i32");
+        const litVal = litNode.value;
+
+        if (litType === "string") {
+          const strLir = this.lowerExpr(litNode, fnCtx);
+          return {
+            op: "call_builtin",
+            builtin: "str_eq",
+            args: [targetLir, strLir],
+            type: "i32",
+          };
+        }
+
+        if (litType === "i64") {
+          return {
+            op: "binop",
+            kind: "eq",
+            left: targetLir,
+            right: {
+              op: "const_i64",
+              value: BigInt(litVal || 0),
+              type: "i64",
+            },
+            type: "i32",
+          };
+        }
+
+        if (litType === "bool") {
+          return {
+            op: "binop",
+            kind: "eq",
+            left: targetLir,
+            right: { op: "const_i32", value: litVal ? 1 : 0, type: "i32" },
+            type: "i32",
+          };
+        }
+
+        return {
+          op: "binop",
+          kind: "eq",
+          left: targetLir,
+          right: { op: "const_i32", value: Number(litVal) | 0, type: "i32" },
+          type: "i32",
+        };
+      }
+
+      case "EnumPattern": {
+        let tagIndex = 0;
+        let variantDef = null;
+        if (this.env) {
+          const vInfo = this.env.lookupVariant(
+            pattern.enumName,
+            pattern.variantName
+          );
+          if (vInfo) {
+            tagIndex = vInfo.tagIndex;
+            const enumDef = this.env.getEnum(vInfo.enumName);
+            if (enumDef) {
+              variantDef = enumDef.variants.find(
+                (v) => v.name === pattern.variantName
+              );
+            }
+          }
+        }
+
+        const tagLoad = {
+          op: "mem_load",
+          ptr: targetLir,
+          offset: 8,
+          loadType: "i32",
+          type: "i32",
+        };
+        const tagCond = {
+          op: "binop",
+          kind: "eq",
+          left: tagLoad,
+          right: { op: "const_i32", value: tagIndex, type: "i32" },
+          type: "i32",
+        };
+
+        let combinedCond = tagCond;
+        for (let i = 0; i < (pattern.args || []).length; i++) {
+          const argPat = pattern.args[i];
+          const argType =
+            variantDef && variantDef.fields && variantDef.fields[i]
+              ? semanticTypeToLirType(variantDef.fields[i])
+              : "i32";
+          const fieldLoad = {
+            op: "mem_load",
+            ptr: targetLir,
+            offset: 16 + 8 * i,
+            loadType: argType,
+            type: argType,
+          };
+          const subCond = this.lowerPatternMatch(
+            argPat,
+            fieldLoad,
+            fnCtx,
+            bindStmts
+          );
+          combinedCond = {
+            op: "binop",
+            kind: "and",
+            left: combinedCond,
+            right: subCond,
+            type: "i32",
+          };
+        }
+        return combinedCond;
+      }
+
+      case "StructPattern": {
+        let structDef = null;
+        if (this.env) {
+          structDef = this.env.getStruct(pattern.structName);
+        }
+        let combinedCond = { op: "const_i32", value: 1, type: "i32" };
+        for (const f of pattern.fields || []) {
+          let fieldIndex = 0;
+          let fieldType = "i32";
+          if (structDef) {
+            const idx = structDef.fields.findIndex((df) => df.name === f.name);
+            if (idx !== -1) {
+              fieldIndex = idx;
+              fieldType = semanticTypeToLirType(structDef.fields[idx].type);
+            }
+          }
+          const fieldLoad = {
+            op: "mem_load",
+            ptr: targetLir,
+            offset: 8 + 8 * fieldIndex,
+            loadType: fieldType,
+            type: fieldType,
+          };
+          const subCond = this.lowerPatternMatch(
+            f.pattern,
+            fieldLoad,
+            fnCtx,
+            bindStmts
+          );
+          combinedCond = {
+            op: "binop",
+            kind: "and",
+            left: combinedCond,
+            right: subCond,
+            type: "i32",
+          };
+        }
+        return combinedCond;
+      }
+
+      default:
+        return { op: "const_i32", value: 1, type: "i32" };
     }
   }
 }
